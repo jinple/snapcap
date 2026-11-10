@@ -16,7 +16,7 @@ mod protocol;
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -27,11 +27,26 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, GetCurrentProcessId, SetWaitableTimer, WaitForSingleObject,
+};
 use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPED};
 use windows::core::{BOOL, HRESULT, Interface, PCSTR, w};
 
 use protocol::*;
+
+// Volatile accessors for the shared header (SnapCap writes it from another process).
+macro_rules! rd {
+    ($h:expr, $f:ident) => {
+        std::ptr::read_volatile(&raw const (*$h).$f)
+    };
+}
+macro_rules! wr {
+    ($h:expr, $f:ident, $v:expr) => {
+        std::ptr::write_volatile(&raw mut (*$h).$f, $v)
+    };
+}
 
 static ORIG_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static ORIG_PRESENT1: AtomicUsize = AtomicUsize::new(0);
@@ -175,6 +190,7 @@ thread_local! { static IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell:
 unsafe extern "system" fn present_hook(this: *mut c_void, sync: u32, flags: u32) -> HRESULT {
     unsafe {
         guarded(this);
+        limit_frame();
         let f: PresentFn = std::mem::transmute(ORIG_PRESENT.load(Ordering::SeqCst));
         f(this, sync, flags)
     }
@@ -183,8 +199,84 @@ unsafe extern "system" fn present_hook(this: *mut c_void, sync: u32, flags: u32)
 unsafe extern "system" fn present1_hook(this: *mut c_void, sync: u32, flags: u32, p: *const c_void) -> HRESULT {
     unsafe {
         guarded(this);
+        limit_frame();
         let f: Present1Fn = std::mem::transmute(ORIG_PRESENT1.load(Ordering::SeqCst));
         f(this, sync, flags, p)
+    }
+}
+
+// ---- frame limiter ------------------------------------------------------------------------
+// Paces Present calls to the cap SnapCap wrote into the shared header. We wait *before* the
+// real Present, so frames leave at an even rate. Anything stale or odd just means "no limit".
+
+static NEXT_PRESENT: AtomicI64 = AtomicI64::new(0); // QPC ticks when the next Present may go
+static TIMER: AtomicUsize = AtomicUsize::new(0); // high-resolution waitable timer handle
+static QPC_FREQ: AtomicI64 = AtomicI64::new(0);
+
+unsafe fn qpc() -> i64 {
+    unsafe {
+        let mut v = 0i64;
+        let _ = QueryPerformanceCounter(&mut v);
+        v
+    }
+}
+
+unsafe fn limit_frame() {
+    let _ = std::panic::catch_unwind(|| unsafe {
+        let h = header();
+        if h.is_null() {
+            return;
+        }
+        let lim = rd!(h, fps_limit);
+        // SnapCap gone? Never keep throttling a game nobody is controlling any more.
+        if lim == 0 || GetTickCount64().saturating_sub(rd!(h, main_tick)) > 2000 {
+            NEXT_PRESENT.store(0, Ordering::Relaxed);
+            return;
+        }
+        let mut freq = QPC_FREQ.load(Ordering::Relaxed);
+        if freq == 0 {
+            let _ = QueryPerformanceFrequency(&mut freq);
+            QPC_FREQ.store(freq, Ordering::Relaxed);
+        }
+        let interval = freq / lim.clamp(1, 1000) as i64;
+        let now = qpc();
+        let target = NEXT_PRESENT.load(Ordering::Relaxed);
+        let go_at = if target == 0 || now >= target { now } else { wait_until(target, freq); target };
+        // If we ran late, restart the cadence from now instead of bursting to catch up.
+        NEXT_PRESENT.store(go_at + interval, Ordering::Relaxed);
+    });
+}
+
+/// Coarse wait on a high-resolution waitable timer, then spin for the last ~1.5 ms.
+unsafe fn wait_until(target: i64, freq: i64) {
+    unsafe {
+        let mut timer = TIMER.load(Ordering::Relaxed);
+        if timer == 0 {
+            // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 2, TIMER_ALL_ACCESS = 0x1F0003
+            timer = CreateWaitableTimerExW(None, windows::core::PCWSTR::null(), 2, 0x1F0003)
+                .map(|h| h.0 as usize)
+                .unwrap_or(usize::MAX);
+            TIMER.store(timer, Ordering::Relaxed);
+        }
+        loop {
+            let now = qpc();
+            if now >= target {
+                return;
+            }
+            let left_us = (target - now) * 1_000_000 / freq;
+            if left_us > 1500 {
+                let coarse_100ns = -((left_us - 1000) * 10);
+                if timer != usize::MAX
+                    && SetWaitableTimer(HANDLE(timer as *mut c_void), &coarse_100ns, 0, None, None, false).is_ok()
+                {
+                    WaitForSingleObject(HANDLE(timer as *mut c_void), 100);
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros((left_us - 1000) as u64));
+                }
+            } else {
+                std::hint::spin_loop();
+            }
+        }
     }
 }
 
@@ -224,17 +316,6 @@ unsafe fn header() -> *mut Header {
         VIEW.store(view.Value as usize, Ordering::Relaxed);
         hdr
     }
-}
-
-macro_rules! rd {
-    ($h:expr, $f:ident) => {
-        std::ptr::read_volatile(&raw const (*$h).$f)
-    };
-}
-macro_rules! wr {
-    ($h:expr, $f:ident, $v:expr) => {
-        std::ptr::write_volatile(&raw mut (*$h).$f, $v)
-    };
 }
 
 const HLSL: &str = r#"

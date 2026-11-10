@@ -29,8 +29,12 @@ pub struct Settings {
     /// Inject the in-game overlay hook into exclusive-fullscreen Direct3D 11 games.
     /// Off by default: it loads a DLL into the game process.
     pub hook_enabled: bool,
+    /// Frame-rate cap for the focused app in FPS (0 = off). Needs the in-game hook.
+    pub fps_limit: u32,
     pub keys: [Key; 4],
 }
+
+pub const MAX_FPS_LIMIT: u32 = 240;
 
 pub const DEFAULT_KEYS: [Key; 4] = [
     Key { vk: VK_F9.0 as u32, mods: 0 },
@@ -41,7 +45,7 @@ pub const DEFAULT_KEYS: [Key; 4] = [
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { counter_pct: 100, label_pct: 100, overlay_in_rec: false, hook_enabled: false, keys: DEFAULT_KEYS }
+        Self { counter_pct: 100, label_pct: 100, overlay_in_rec: false, hook_enabled: false, fps_limit: 0, keys: DEFAULT_KEYS }
     }
 }
 
@@ -61,6 +65,7 @@ impl Settings {
                 "label_pct" => s.label_pct = v.parse().unwrap_or(100).clamp(MIN_PCT, MAX_PCT),
                 "overlay_in_recording" => s.overlay_in_rec = v == "1",
                 "ingame_hook" => s.hook_enabled = v == "1",
+                "fps_limit" => s.fps_limit = v.parse().unwrap_or(0).min(MAX_FPS_LIMIT),
                 _ => {
                     if let Some(i) = k.strip_prefix("key").and_then(|n| n.parse::<usize>().ok()) {
                         if let (true, Some((vk, mods))) = (i < 4, v.split_once(',')) {
@@ -83,8 +88,8 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut t = format!(
-            "counter_pct={}\nlabel_pct={}\noverlay_in_recording={}\ningame_hook={}\n",
-            self.counter_pct, self.label_pct, self.overlay_in_rec as u8, self.hook_enabled as u8
+            "counter_pct={}\nlabel_pct={}\noverlay_in_recording={}\ningame_hook={}\nfps_limit={}\n",
+            self.counter_pct, self.label_pct, self.overlay_in_rec as u8, self.hook_enabled as u8, self.fps_limit
         );
         for (i, k) in self.keys.iter().enumerate() {
             t += &format!("key{i}={},{}\n", k.vk, k.mods);

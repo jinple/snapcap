@@ -92,6 +92,23 @@ impl HookClient {
         }
     }
 
+    pub fn has(&self, pid: u32) -> bool {
+        self.maps.contains_key(&pid)
+    }
+
+    /// Frame cap for the focused app (`target`); every other hooked app is set to unlimited.
+    pub unsafe fn apply_limit(&self, target: u32, limit: u32) {
+        unsafe {
+            for (&pid, m) in &self.maps {
+                let h = m.view as *mut Header;
+                let want = if pid == target { limit } else { 0 };
+                if std::ptr::read_volatile(&raw const (*h).fps_limit) != want {
+                    std::ptr::write_volatile(&raw mut (*h).fps_limit, want);
+                }
+            }
+        }
+    }
+
     /// Heartbeat so the hook knows SnapCap is alive (it goes idle if this stops).
     pub unsafe fn heartbeat(&self, pid: u32) {
         unsafe {

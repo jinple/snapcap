@@ -460,17 +460,28 @@ impl App {
 
             // In-game hook (opt-in, exclusive fullscreen D3D11 only): engage it, keep it
             // alive, and use the game's real Present rate for the FPS readout.
-            let mut hook_live = false;
+            let limit = self.settings.fps_limit;
+            let overlay_hook = self.settings.hook_enabled;
+            let mut hook_alive = false;
             let mut game_fps10 = 0;
-            if self.settings.hook_enabled && target.pid != 0 {
-                if self.exclusive {
+            if target.pid != 0 && (overlay_hook || limit > 0 || self.hook.has(target.pid)) {
+                // Load the hook for the overlay (exclusive fullscreen only) or to cap frames
+                // (any time a limit is set).
+                if (overlay_hook && self.exclusive) || limit > 0 {
                     self.hook.ensure(target.pid);
                 }
                 self.hook.heartbeat(target.pid);
-                hook_live = self.hook.alive(target.pid);
-                if hook_live {
+                hook_alive = self.hook.alive(target.pid);
+                if hook_alive {
                     game_fps10 = self.hook.fps10(target.pid);
                 }
+            }
+            // The cap applies to whatever is focused; any other hooked app runs unlimited.
+            self.hook.apply_limit(target.pid, if hook_alive { limit } else { 0 });
+            // Only draw the overlay through the hook if the user asked for that.
+            let hook_live = hook_alive && overlay_hook;
+            if hook_alive && self.last_excl_check.elapsed().as_millis() < 20 && std::env::var_os("SNAPCAP_STATS").is_some() {
+                eprintln!("game {} measured {:.1} fps (limit {})", target.name, game_fps10 as f32 / 10.0, limit);
             }
             self.shared.hook_fps10.store(game_fps10, Ordering::Relaxed);
 

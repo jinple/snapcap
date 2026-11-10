@@ -28,7 +28,8 @@ pub struct Header {
     pub y: i32,
     /// 1 = the recorder wants pre-overlay frames from the hook.
     pub want_capture: u32,
-    pub _pad0: u32,
+    /// Frame-rate cap in FPS for this process (0 = unlimited). The hook paces Present to it.
+    pub fps_limit: u32,
     // ---- hook -> SnapCap ----
     pub hook_pid: u32,
     /// DXGI_FORMAT of the game's back buffer.

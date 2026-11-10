@@ -25,6 +25,8 @@ const LBL_COUNTER: i32 = 103;
 const LBL_LABEL: i32 = 104;
 const CHK_REC: i32 = 105;
 const CHK_HOOK: i32 = 106;
+const SL_LIMIT: i32 = 107;
+const LBL_LIMIT: i32 = 108;
 const HK_BASE: i32 = 110; // 110..=113
 const BTN_SAVE: i32 = 120;
 const BTN_CLOSE: i32 = 121;
@@ -66,7 +68,7 @@ pub unsafe fn open(s: &Settings) {
         });
 
         let k = GetDpiForSystem() as f32 / 96.0;
-        let (cw, ch) = ((420.0 * k) as i32, (458.0 * k) as i32);
+        let (cw, ch) = ((420.0 * k) as i32, (516.0 * k) as i32);
         let style = WS_CAPTION | WS_SYSMENU;
         let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
         let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_TOPMOST);
@@ -211,54 +213,68 @@ unsafe fn create_controls(hwnd: HWND, s: &Settings) {
         SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.counter_pct as isize)));
         child(hwnd, stat, &format!("{}%", s.counter_pct), st_right, (346, 40, 56, 20), LBL_COUNTER, k);
 
-        child(hwnd, stat, "App name / timer / hints", 0, (16, 76, 150, 20), 0, k);
+        child(hwnd, stat, "App name / timer / hints", 0, (16, 76, 142, 20), 0, k);
         let sl = child(hwnd, w!("msctls_trackbar32"), "", ws_tab | 1, (160, 70, 180, 30), SL_LABEL, k);
         SendMessageW(sl, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((MAX_PCT << 16) | MIN_PCT) as isize)));
         SendMessageW(sl, TBM_SETTICFREQ, Some(WPARAM(25)), None);
         SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.label_pct as isize)));
         child(hwnd, stat, &format!("{}%", s.label_pct), st_right, (346, 76, 56, 20), LBL_LABEL, k);
 
+        child(hwnd, stat, "Frame limit (focused app)", 0, (16, 112, 142, 20), 0, k);
+        let sl = child(hwnd, w!("msctls_trackbar32"), "", ws_tab | 1, (160, 106, 180, 30), SL_LIMIT, k);
+        SendMessageW(sl, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((MAX_FPS_LIMIT << 16) | 0) as isize)));
+        SendMessageW(sl, TBM_SETTICFREQ, Some(WPARAM(30)), None);
+        SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.fps_limit as isize)));
+        child(hwnd, stat, &limit_text(s.fps_limit), st_right, (346, 112, 56, 20), LBL_LIMIT, k);
+        child(hwnd, stat, "Caps the game's frame rate. Loads the in-game hook (Direct3D 11 games only, never anti-cheat).", 0, (34, 138, 372, 34), 0, k);
+
         let chk = child(
             hwnd,
             btn,
             "Show overlay in recordings",
             ws_tab | 3, /*BS_AUTOCHECKBOX*/
-            (16, 118, 380, 22),
+            (16, 176, 380, 22),
             CHK_REC,
             k,
         );
         SendMessageW(chk, BM_SETCHECK, Some(WPARAM(s.overlay_in_rec as usize)), None);
-        child(hwnd, stat, "(off: not in the video. On also works in exclusive fullscreen)", 0, (34, 140, 360, 18), 0, k);
+        child(hwnd, stat, "(off: not in the video. On also works in exclusive fullscreen)", 0, (34, 198, 360, 18), 0, k);
 
         let hk = child(
             hwnd,
             btn,
             "In-game overlay for exclusive fullscreen (experimental)",
             ws_tab | 3,
-            (16, 170, 390, 22),
+            (16, 228, 390, 22),
             CHK_HOOK,
             k,
         );
         SendMessageW(hk, BM_SETCHECK, Some(WPARAM(s.hook_enabled as usize)), None);
-        child(hwnd, stat, "Loads a DLL into Direct3D 11 games to draw the overlay inside them. Never used with anti-cheat. Applies the next time you play.", 0, (34, 192, 372, 34), 0, k);
+        child(hwnd, stat, "Loads a DLL into Direct3D 11 games to draw the overlay inside them. Never used with anti-cheat. Applies the next time you play.", 0, (34, 250, 372, 34), 0, k);
 
-        child(hwnd, stat, "Keybinds  (click a box, then press the keys)", 0, (16, 236, 380, 20), 0, k);
+        child(hwnd, stat, "Keybinds  (click a box, then press the keys)", 0, (16, 294, 380, 20), 0, k);
         for (i, name) in ACTION_NAMES.iter().enumerate() {
-            let y = 262 + 36 * i as i32;
+            let y = 320 + 36 * i as i32;
             child(hwnd, stat, name, 0, (16, y + 4, 140, 20), 0, k);
             child(hwnd, w!("msctls_hotkey32"), "", ws_tab, (160, y, 180, 26), HK_BASE + i as i32, k);
         }
         fill_keys(hwnd, &s.keys);
 
-        child(hwnd, btn, "Reset defaults", ws_tab, (16, 418, 110, 28), BTN_RESET, k);
-        child(hwnd, btn, "Save", ws_tab | 1 /*BS_DEFPUSHBUTTON*/, (236, 418, 80, 28), BTN_SAVE, k);
-        child(hwnd, btn, "Close", ws_tab, (322, 418, 80, 28), BTN_CLOSE, k);
+        child(hwnd, btn, "Reset defaults", ws_tab, (16, 476, 110, 28), BTN_RESET, k);
+        child(hwnd, btn, "Save", ws_tab | 1 /*BS_DEFPUSHBUTTON*/, (236, 476, 80, 28), BTN_SAVE, k);
+        child(hwnd, btn, "Close", ws_tab, (322, 476, 80, 28), BTN_CLOSE, k);
     }
+}
+
+fn limit_text(l: u32) -> String {
+    if l == 0 { "Off".into() } else { format!("{l} FPS") }
 }
 
 unsafe fn apply_visuals(hwnd: HWND) {
     unsafe {
         let (c, l) = (read_slider(hwnd, SL_COUNTER), read_slider(hwnd, SL_LABEL));
+        let limit = read_slider(hwnd, SL_LIMIT).min(MAX_FPS_LIMIT);
+        set_text(hwnd, LBL_LIMIT, &limit_text(limit));
         let on = SendMessageW(get_item(hwnd, CHK_REC), BM_GETCHECK, None, None).0 == 1;
         let hook = SendMessageW(get_item(hwnd, CHK_HOOK), BM_GETCHECK, None, None).0 == 1;
         set_text(hwnd, LBL_COUNTER, &format!("{c}%"));
@@ -268,6 +284,7 @@ unsafe fn apply_visuals(hwnd: HWND) {
             app.settings.label_pct = l;
             app.settings.overlay_in_rec = on;
             app.settings.hook_enabled = hook;
+            app.settings.fps_limit = limit;
             app.apply_visuals();
         });
     }
@@ -303,6 +320,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         SendMessageW(get_item(hwnd, SL_LABEL), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(d.label_pct as isize)));
                         SendMessageW(get_item(hwnd, CHK_REC), BM_SETCHECK, Some(WPARAM(d.overlay_in_rec as usize)), None);
                         SendMessageW(get_item(hwnd, CHK_HOOK), BM_SETCHECK, Some(WPARAM(d.hook_enabled as usize)), None);
+                        SendMessageW(get_item(hwnd, SL_LIMIT), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(d.fps_limit as isize)));
                         fill_keys(hwnd, &d.keys);
                         apply_visuals(hwnd);
                     }

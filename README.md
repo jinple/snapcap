@@ -8,6 +8,8 @@ fullscreen window to MP4 and puts a clear **FPS counter** over it, with the app 
 - **Per-app audio:** records only the audio of the app you're recording (plus its child processes).
 - **Hardware encoding:** H.264 + AAC in an MP4, written to `Videos\SnapCap`.
 - **Settings (F8):** font sizes, whether the overlay is burned into recordings, rebindable hotkeys.
+- **Frame limit:** cap the focused game's frame rate from settings (Direct3D 11 games; released
+  automatically if SnapCap quits). It uses the same in-game hook as the overlay below.
 - **Exclusive fullscreen:** burn-in always works. For the *live* overlay over exclusive fullscreen,
   enable the experimental in-game overlay (Direct3D 11 games only; never use it with anti-cheat).
 
