@@ -1,6 +1,6 @@
 [package]
 name = "snapcap"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "SnapCap - featherweight gameplay recorder with a burned-in frame counter"
 
