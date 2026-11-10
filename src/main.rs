@@ -333,15 +333,6 @@ impl App {
         }
     }
 
-    /// Audible feedback, used when the overlay can't be seen (exclusive fullscreen).
-    fn beep(&self, tones: &'static [(u32, u32)]) {
-        std::thread::spawn(move || {
-            for &(hz, ms) in tones {
-                let _ = unsafe { windows::Win32::System::Diagnostics::Debug::Beep(hz, ms) };
-            }
-        });
-    }
-
     /// Polls whether a true exclusive-fullscreen Direct3D app is running.
     unsafe fn check_exclusive(&mut self) {
         unsafe {
@@ -360,10 +351,9 @@ impl App {
                         eprintln!(
                             "exclusive fullscreen detected: Windows won't show a normal overlay window over it. \
                              Tick \"In-game overlay for exclusive fullscreen\" in settings (F8) to draw it inside \
-                             the game, or use Borderless in the game. You'll get beeps for rec start/stop instead."
+                             the game, or use Borderless in the game."
                         );
                     }
-                    self.beep(&[(1200, 60)]);
                 }
             }
         }
@@ -381,9 +371,6 @@ impl App {
             if self.shared.recording.load(Ordering::SeqCst) {
                 self.shared.stop.store(true, Ordering::SeqCst);
                 println!("stopping...");
-                if self.exclusive {
-                    self.beep(&[(1200, 80), (800, 120)]);
-                }
                 return;
             }
             if self.worker.is_some() {
@@ -418,9 +405,6 @@ impl App {
             };
             let shared = self.shared.clone();
             self.worker = Some(std::thread::spawn(move || capture::run(job, shared)));
-            if self.exclusive {
-                self.beep(&[(800, 80), (1200, 120)]);
-            }
             self.last_key = None;
             self.tick();
         }
@@ -433,9 +417,6 @@ impl App {
                 let _ = self.worker.take().unwrap().join();
                 self.shared.stop.store(false, Ordering::SeqCst);
                 self.locked = false;
-                if self.shared.failed.swap(false, Ordering::SeqCst) {
-                    self.beep(&[(300, 180), (250, 300)]); // always audible: the take was lost
-                }
             }
             self.check_exclusive();
             // Games often grab HWND_TOPMOST themselves; keep re-asserting ours so the

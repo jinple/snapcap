@@ -26,8 +26,6 @@ pub const WM_FRAME: u32 = 0x8000 + 1; // WM_APP + 1
 pub struct Shared {
     pub recording: AtomicBool,
     pub stop: AtomicBool,
-    /// Set when the last recording ended with an error.
-    pub failed: AtomicBool,
     /// Draw the overlay into recorded frames ("Show overlay in recordings").
     pub burn: AtomicBool,
     /// Overlay font-size percentages (from settings), used when burning in.
@@ -159,7 +157,6 @@ pub fn run(job: Job, shared: Arc<Shared>) {
         Ok(n) => println!("saved {n} frames -> {}", job.path.display()),
         Err(e) => {
             eprintln!("recording failed while {}: {e}", STAGE.get());
-            shared.failed.store(true, Ordering::SeqCst);
         }
     }
     shared.recording.store(false, Ordering::SeqCst);
