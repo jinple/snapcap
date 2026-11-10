@@ -26,6 +26,8 @@ pub const WM_FRAME: u32 = 0x8000 + 1; // WM_APP + 1
 pub struct Shared {
     pub recording: AtomicBool,
     pub stop: AtomicBool,
+    /// Latest message for the control window (set when a recording finishes or fails).
+    pub note: std::sync::Mutex<Option<String>>,
     /// Draw the overlay into recorded frames ("Show overlay in recordings").
     pub burn: AtomicBool,
     /// Overlay font-size percentages (from settings), used when burning in.
@@ -154,9 +156,18 @@ pub fn run(job: Job, shared: Arc<Shared>) {
         r
     };
     match res {
-        Ok(n) => println!("saved {n} frames -> {}", job.path.display()),
+        Ok(n) => {
+            println!("saved {n} frames -> {}", job.path.display());
+            let file = job.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            if let Ok(mut note) = shared.note.lock() {
+                *note = Some(format!("Saved {file} ({n} frames)"));
+            }
+        }
         Err(e) => {
             eprintln!("recording failed while {}: {e}", STAGE.get());
+            if let Ok(mut note) = shared.note.lock() {
+                *note = Some(format!("Recording failed while {}: {e}", STAGE.get()));
+            }
         }
     }
     shared.recording.store(false, Ordering::SeqCst);

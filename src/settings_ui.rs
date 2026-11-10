@@ -93,6 +93,7 @@ pub unsafe fn open(s: &Settings) {
         );
         match hwnd {
             Ok(h) => {
+                crate::main_window::set_window_icons(h);
                 SETTINGS_HWND.set(h.0 as isize);
                 let _ = ShowWindow(h, SW_SHOW);
                 let _ = SetForegroundWindow(h);

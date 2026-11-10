@@ -7,6 +7,8 @@ fullscreen window to MP4 and puts a clear **FPS counter** over it, with the app 
 - **FPS counter:** white with a black outline when idle, red when recording.
 - **Per-app audio:** records only the audio of the app you're recording (plus its child processes).
 - **Hardware encoding:** H.264 + AAC in an MP4, written to `Videos\SnapCap`.
+- **Taskbar app:** no console window. SnapCap has its own icon and a small control window; the
+  taskbar button's title shows `REC 00:42` and the icon gets a red badge while recording.
 - **Settings (F8):** font sizes, whether the overlay is burned into recordings, rebindable hotkeys.
 - **Frame limit:** cap the focused game's frame rate from settings (Direct3D 11 games; released
   automatically if SnapCap quits). It uses the same in-game hook as the overlay below.
@@ -36,7 +38,9 @@ Requires Windows 10 2004+ and a recent Rust toolchain.
 cargo build --release   # builds snapcap.exe and snapcap_hook.dll into target\release
 ```
 
-`snapcap_hook.dll` must stay next to `snapcap.exe`.
+`snapcap_hook.dll` must stay next to `snapcap.exe`. Run `snapcap.exe --help` for command-line
+options (it attaches to the terminal it was started from; launched from Explorer it has no console).
+The app icon is `assets\snapcap.ico`; `scripts\make-icon.ps1` regenerates it.
 
 ## Releasing (maintainers)
 

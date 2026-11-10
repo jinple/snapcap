@@ -48,7 +48,8 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\SnapCap"; Filename: "{app}\snapcap.exe"
 Name: "{autodesktop}\SnapCap"; Filename: "{app}\snapcap.exe"; Tasks: desktopicon
-Name: "{userstartup}\SnapCap"; Filename: "{app}\snapcap.exe"; Tasks: startup
+; Launches minimized to the taskbar so it doesn't pop a window up at every sign-in.
+Name: "{userstartup}\SnapCap"; Filename: "{app}\snapcap.exe"; Parameters: "--minimized"; Tasks: startup
 
 [Run]
 Filename: "{app}\snapcap.exe"; Description: "Launch SnapCap"; Flags: nowait postinstall skipifsilent

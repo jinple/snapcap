@@ -6,9 +6,14 @@
 //!   F8   settings
 //!   F11  quit
 
+// A GUI app: no console window. (When started from a terminal we attach to it, so --help and
+// the status messages still print there; see `attach_console`.)
+#![windows_subsystem = "windows"]
+
 mod audio;
 mod capture;
 mod hook_client;
+mod main_window;
 mod overlay;
 mod settings;
 mod settings_ui;
@@ -56,6 +61,8 @@ struct Config {
     bitrate: u32,
     out_dir: std::path::PathBuf,
     overlay: bool,
+    /// Start with the control window minimized to the taskbar (used by the start-with-Windows shortcut).
+    start_minimized: bool,
 }
 
 struct Dib {
@@ -70,6 +77,10 @@ pub(crate) struct App {
     cfg: Config,
     pub(crate) settings: Settings,
     hints: Vec<String>,
+    mw: main_window::MainWindow,
+    /// Last thing worth telling the user (file saved, error, hook status), shown in the window.
+    note: String,
+    last_hook_status: String,
     /// A true exclusive-fullscreen D3D app is running: no window can draw over it.
     exclusive: bool,
     hook: HookClient,
@@ -87,13 +98,36 @@ pub(crate) struct App {
 
 thread_local! { pub(crate) static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
 
+/// A GUI-subsystem exe has no console of its own. If we were started from a terminal, hook
+/// stdout/stderr up to it (unless they were already redirected), so command-line use still works.
+fn attach_console() {
+    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows::Win32::System::Console::*;
+    unsafe {
+        let valid = |h: windows::core::Result<HANDLE>| h.is_ok_and(|h| !h.is_invalid() && !h.0.is_null());
+        if valid(GetStdHandle(STD_OUTPUT_HANDLE)) {
+            return; // already redirected/inherited
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return; // launched from Explorer/Start: no console, and that's the point
+        }
+        for std in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if let Ok(f) = CreateFileW(w!("CONOUT$"), 0x4000_0000, FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None) {
+                let _ = SetStdHandle(std, f);
+            }
+        }
+    }
+}
+
 fn main() {
+    attach_console();
     let cfg = parse_args();
     let renderer = match Renderer::new() {
         Ok(r) => r,
         Err(e) => return eprintln!("error: {e}"),
     };
     unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(None).unwrap();
         let class = w!("SnapCapOverlay");
@@ -126,8 +160,12 @@ fn main() {
             std::thread::spawn(move || capture::monitor(s, h));
         }
         let settings = Settings::load();
+        let mw = main_window::create(cfg.start_minimized);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
+                mw,
+                note: String::new(),
+                last_hook_status: String::new(),
                 cfg,
                 settings,
                 hints: Vec::new(),
@@ -186,6 +224,7 @@ fn parse_args() -> Config {
             .join("Videos")
             .join("SnapCap"),
         overlay: true,
+        start_minimized: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -198,10 +237,11 @@ fn parse_args() -> Config {
                 }
             }
             "--no-overlay" => cfg.overlay = false,
+            "--minimized" => cfg.start_minimized = true,
             "--selftest" => {}
             _ => {
                 println!(
-                    "SnapCap - featherweight recorder\n\n  --fps N        capture rate (default 60)\n  --bitrate N    Mbps (default 16)\n  --out DIR      output folder (default %USERPROFILE%\\Videos\\SnapCap)\n  --no-overlay   start with the overlay hidden\n\nDefault hotkeys: F9 record/stop, F10 overlay, F8 settings, F11 quit.\nPress the settings key to change font sizes and keybinds."
+                    "SnapCap - featherweight recorder\n\n  --fps N        capture rate (default 60)\n  --bitrate N    Mbps (default 16)\n  --out DIR      output folder (default %USERPROFILE%\\Videos\\SnapCap)\n  --no-overlay   start with the overlay hidden\n  --minimized    start minimized to the taskbar\n\nDefault hotkeys: F9 record/stop, F10 overlay, F8 settings, F11 quit.\nPress the settings key to change font sizes and keybinds."
                 );
                 std::process::exit(0);
             }
@@ -231,13 +271,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                                 app.apply_visuals();
                             }
                             ID_SETTINGS => app.open_settings(),
-                            ID_QUIT => {
-                                app.shared.stop.store(true, Ordering::SeqCst);
-                                if let Some(h) = app.worker.take() {
-                                    let _ = h.join();
-                                }
-                                PostQuitMessage(0);
-                            }
+                            ID_QUIT => app.quit(),
                             _ => {}
                         }
                     }
@@ -256,6 +290,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 impl App {
     fn recording(&self) -> bool {
         self.shared.recording.load(Ordering::Relaxed) && !self.shared.stop.load(Ordering::Relaxed)
+    }
+
+    /// Stops any recording cleanly (so the file is finished and playable), then exits.
+    fn quit(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+        unsafe { PostQuitMessage(0) };
     }
 
     fn update_hints(&mut self) {
@@ -377,6 +420,7 @@ impl App {
                 return; // previous take is still finalizing
             }
             let Some(t) = self.target.clone() else {
+                self.note = "Nothing to record: no window in focus.".into();
                 return println!("nothing to record (no focused window)");
             };
             let _ = std::fs::create_dir_all(&self.cfg.out_dir);
@@ -419,6 +463,17 @@ impl App {
                 self.locked = false;
             }
             self.check_exclusive();
+            // Messages for the control window: a finished/failed recording, or why the hook wasn't used.
+            if let Some(n) = self.shared.note.lock().ok().and_then(|mut n| n.take()) {
+                self.note = n;
+            }
+            if self.hook.status != self.last_hook_status {
+                self.last_hook_status = self.hook.status.clone();
+                // Routine refusals (a browser or other non-game has focus) aren't worth a message.
+                if self.last_hook_status.starts_with("hook not injected") && !self.last_hook_status.contains("never injected") {
+                    self.note = format!("In-game hook: {}", self.last_hook_status.trim_start_matches("hook not injected: "));
+                }
+            }
             // Games often grab HWND_TOPMOST themselves; keep re-asserting ours so the
             // overlay doesn't end up underneath a fullscreen-optimized game window.
             if self.cfg.overlay && self.target.is_some() {
@@ -437,7 +492,12 @@ impl App {
                     self.target = Some(t);
                 }
             }
-            let Some(target) = self.target.clone() else { return };
+            let Some(target) = self.target.clone() else {
+                let hints = self.hints.join("  \u{00B7}  ");
+                let (rec, elapsed) = (self.recording(), self.shared.elapsed.load(Ordering::Relaxed));
+                self.mw.update(&main_window::Status { recording: rec, elapsed, name: "", fps: 0, note: &self.note, hints: &hints });
+                return;
+            };
 
             // In-game hook (opt-in, exclusive fullscreen D3D11 only): engage it, keep it
             // alive, and use the game's real Present rate for the FPS readout.
@@ -471,6 +531,10 @@ impl App {
             let f10 = if game_fps10 > 0 { game_fps10 } else { self.shared.fps10.load(Ordering::Relaxed) };
             let fps = (f10 + 5) / 10;
             let elapsed = if rec { self.shared.elapsed.load(Ordering::Relaxed) } else { 0 };
+            {
+                let hints = self.hints.join("  \u{00B7}  ");
+                self.mw.update(&main_window::Status { recording: rec, elapsed, name: &target.name, fps, note: &self.note, hints: &hints });
+            }
             self.shared.watch_x.store((target.rect.0 + target.rect.2) / 2, Ordering::Relaxed);
             self.shared.watch_y.store((target.rect.1 + target.rect.3) / 2, Ordering::Relaxed);
             let pulse_bucket = if rec { (time * 60.0) as i32 } else { 0 };

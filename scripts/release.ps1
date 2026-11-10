@@ -53,6 +53,10 @@ $iscc = @(
 if (-not $iscc) { throw "Inno Setup 6 not found. Install it from https://jrsoftware.org/isinfo.php" }
 
 # ---- bump versions (root crate + hook crate) --------------------------------------------
+# Remember exactly what these files contained, so a -NoPublish run can put them back as they
+# were (a plain `git checkout` would also throw away any uncommitted edits you have in them).
+$snapshot = @{}
+foreach ($f in "Cargo.toml", "hook\Cargo.toml", "Cargo.lock") { $snapshot[$f] = [IO.File]::ReadAllBytes((Join-Path $root $f)) }
 foreach ($f in "Cargo.toml", "hook\Cargo.toml") {
     $text = Get-Content $f -Raw
     $new = ([regex]'(?m)^version = "[^"]+"').Replace($text, "version = `"$Version`"", 1)
@@ -72,7 +76,7 @@ Write-Host "Built $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB
 Write-Host "SHA-256 $hash"
 
 if ($NoPublish) {
-    git checkout -- Cargo.toml hook/Cargo.toml Cargo.lock   # undo the version bump
+    foreach ($f in $snapshot.Keys) { [IO.File]::WriteAllBytes((Join-Path $root $f), $snapshot[$f]) }   # undo the version bump, nothing else
     Write-Host "NoPublish: installer built, nothing committed, tagged or pushed."
     return
 }
