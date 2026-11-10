@@ -8,8 +8,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 /// Order of `Settings::keys` (index + 1 is the global hotkey id).
 pub const ACTION_NAMES: [&str; 4] = ["Toggle Rec", "Toggle Overlay", "Settings", "Quit"];
 
-pub const MIN_PCT: u32 = 50;
-pub const MAX_PCT: u32 = 250;
+/// Any size can be typed in, within these bounds (the sliders cover the common part).
+pub const MIN_PCT: u32 = 10;
+pub const MAX_PCT: u32 = 500;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Key {

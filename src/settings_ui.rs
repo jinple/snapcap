@@ -21,8 +21,6 @@ use crate::settings::*;
 const TBM_GETPOS: u32 = 0x0400; // WM_USER
 const SL_COUNTER: i32 = 101;
 const SL_LABEL: i32 = 102;
-const LBL_COUNTER: i32 = 103;
-const LBL_LABEL: i32 = 104;
 const CHK_REC: i32 = 105;
 const CHK_HOOK: i32 = 106;
 const SL_LIMIT: i32 = 107;
@@ -31,6 +29,9 @@ const HK_BASE: i32 = 110; // 110..=113
 const BTN_SAVE: i32 = 120;
 const BTN_CLOSE: i32 = 121;
 const BTN_RESET: i32 = 122;
+const EDT_COUNTER: i32 = 130;
+const EDT_LABEL: i32 = 131;
+const SLIDER_MAX: u32 = 300; // the sliders stop here; the boxes accept up to MAX_PCT
 
 thread_local! {
     static SETTINGS_HWND: Cell<isize> = const { Cell::new(0) };
@@ -209,17 +210,17 @@ unsafe fn create_controls(hwnd: HWND, s: &Settings) {
         child(hwnd, stat, "Font sizes", 0, (16, 10, 380, 20), 0, k);
         child(hwnd, stat, "FPS counter", 0, (16, 40, 140, 20), 0, k);
         let sl = child(hwnd, w!("msctls_trackbar32"), "", ws_tab | 1 /*TBS_AUTOTICKS*/, (160, 34, 180, 30), SL_COUNTER, k);
-        SendMessageW(sl, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((MAX_PCT << 16) | MIN_PCT) as isize)));
+        SendMessageW(sl, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((SLIDER_MAX << 16) | MIN_PCT) as isize)));
         SendMessageW(sl, TBM_SETTICFREQ, Some(WPARAM(25)), None);
-        SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.counter_pct as isize)));
-        child(hwnd, stat, &format!("{}%", s.counter_pct), st_right, (346, 40, 56, 20), LBL_COUNTER, k);
+        SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.counter_pct.min(SLIDER_MAX) as isize)));
+        pct_box(hwnd, EDT_COUNTER, s.counter_pct, 38, k);
 
         child(hwnd, stat, "App name / timer / hints", 0, (16, 76, 142, 20), 0, k);
         let sl = child(hwnd, w!("msctls_trackbar32"), "", ws_tab | 1, (160, 70, 180, 30), SL_LABEL, k);
-        SendMessageW(sl, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((MAX_PCT << 16) | MIN_PCT) as isize)));
+        SendMessageW(sl, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((SLIDER_MAX << 16) | MIN_PCT) as isize)));
         SendMessageW(sl, TBM_SETTICFREQ, Some(WPARAM(25)), None);
-        SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.label_pct as isize)));
-        child(hwnd, stat, &format!("{}%", s.label_pct), st_right, (346, 76, 56, 20), LBL_LABEL, k);
+        SendMessageW(sl, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(s.label_pct.min(SLIDER_MAX) as isize)));
+        pct_box(hwnd, EDT_LABEL, s.label_pct, 74, k);
 
         child(hwnd, stat, "Frame limit (focused app)", 0, (16, 112, 142, 20), 0, k);
         let sl = child(hwnd, w!("msctls_trackbar32"), "", ws_tab | 1, (160, 106, 180, 30), SL_LIMIT, k);
@@ -267,19 +268,52 @@ unsafe fn create_controls(hwnd: HWND, s: &Settings) {
     }
 }
 
+/// A small numeric box plus a "%" sign, so any size can be typed in.
+unsafe fn pct_box(hwnd: HWND, id: i32, v: u32, y: i32, k: f32) {
+    unsafe {
+        // WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL | ES_RIGHT
+        let e = child(hwnd, w!("EDIT"), &v.to_string(), WS_TABSTOP.0 | 0x0080_0000 | 0x2000 | 0x80 | 2, (344, y, 44, 22), id, k);
+        SendMessageW(e, 0x00C5 /*EM_LIMITTEXT*/, Some(WPARAM(3)), None);
+        child(hwnd, w!("STATIC"), "%", 0, (392, y + 3, 16, 18), 0, k);
+    }
+}
+
 fn limit_text(l: u32) -> String {
     if l == 0 { "Off".into() } else { format!("{l} FPS") }
 }
 
+/// The number typed in a size box, if it parses, clamped to the allowed range.
+unsafe fn read_pct(hwnd: HWND, id: i32) -> Option<u32> {
+    unsafe {
+        let mut buf = [0u16; 8];
+        let n = GetWindowTextW(get_item(hwnd, id), &mut buf).max(0) as usize;
+        String::from_utf16_lossy(&buf[..n]).trim().parse::<u32>().ok().map(|v| v.clamp(MIN_PCT, MAX_PCT))
+    }
+}
+
+/// Slider moved -> mirror it into its box.
+unsafe fn sync_box_from_slider(hwnd: HWND, slider: i32, edit: i32) {
+    unsafe { set_text(hwnd, edit, &read_slider(hwnd, slider).to_string()) }
+}
+
+/// Box edited -> move the slider to match (it stops at SLIDER_MAX; the box keeps the real value).
+unsafe fn sync_slider_from_box(hwnd: HWND, slider: i32, edit: i32) {
+    unsafe {
+        if let Some(v) = read_pct(hwnd, edit) {
+            SendMessageW(get_item(hwnd, slider), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(v.min(SLIDER_MAX) as isize)));
+        }
+    }
+}
+
 unsafe fn apply_visuals(hwnd: HWND) {
     unsafe {
-        let (c, l) = (read_slider(hwnd, SL_COUNTER), read_slider(hwnd, SL_LABEL));
+        let (c0, l0) = with_app(|a| (a.settings.counter_pct, a.settings.label_pct)).unwrap_or((100, 100));
+        let c = read_pct(hwnd, EDT_COUNTER).unwrap_or(c0); // half-typed/empty box: keep the last good value
+        let l = read_pct(hwnd, EDT_LABEL).unwrap_or(l0);
         let limit = read_slider(hwnd, SL_LIMIT).min(MAX_FPS_LIMIT);
         set_text(hwnd, LBL_LIMIT, &limit_text(limit));
         let on = SendMessageW(get_item(hwnd, CHK_REC), BM_GETCHECK, None, None).0 == 1;
         let hook = SendMessageW(get_item(hwnd, CHK_HOOK), BM_GETCHECK, None, None).0 == 1;
-        set_text(hwnd, LBL_COUNTER, &format!("{c}%"));
-        set_text(hwnd, LBL_LABEL, &format!("{l}%"));
         with_app(|app| {
             app.settings.counter_pct = c;
             app.settings.label_pct = l;
@@ -308,6 +342,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(0)
             }
             WM_HSCROLL => {
+                // only touch a box when its own slider moved (the sliders cap at 300, the boxes don't)
+                let src = GetDlgCtrlID(HWND(lp.0 as _));
+                if src == SL_COUNTER {
+                    sync_box_from_slider(hwnd, SL_COUNTER, EDT_COUNTER);
+                } else if src == SL_LABEL {
+                    sync_box_from_slider(hwnd, SL_LABEL, EDT_LABEL);
+                }
                 apply_visuals(hwnd);
                 LRESULT(0)
             }
@@ -315,10 +356,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let (id, code) = ((wp.0 & 0xFFFF) as i32, ((wp.0 >> 16) & 0xFFFF) as u32);
                 match id {
                     CHK_REC | CHK_HOOK if code == 0 => apply_visuals(hwnd),
+                    EDT_COUNTER | EDT_LABEL if code == 0x0300 /*EN_CHANGE*/ => {
+                        let slider = if id == EDT_COUNTER { SL_COUNTER } else { SL_LABEL };
+                        sync_slider_from_box(hwnd, slider, id);
+                        apply_visuals(hwnd);
+                    }
+                    EDT_COUNTER | EDT_LABEL if code == 0x0200 /*EN_KILLFOCUS*/ => {
+                        // tidy whatever was typed (empty / out of range) into a valid number
+                        let v = read_pct(hwnd, id).unwrap_or(100);
+                        set_text(hwnd, id, &v.to_string());
+                    }
                     BTN_RESET if code == 0 => {
                         let d = Settings::default();
                         SendMessageW(get_item(hwnd, SL_COUNTER), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(d.counter_pct as isize)));
                         SendMessageW(get_item(hwnd, SL_LABEL), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(d.label_pct as isize)));
+                        set_text(hwnd, EDT_COUNTER, &d.counter_pct.to_string());
+                        set_text(hwnd, EDT_LABEL, &d.label_pct.to_string());
                         SendMessageW(get_item(hwnd, CHK_REC), BM_SETCHECK, Some(WPARAM(d.overlay_in_rec as usize)), None);
                         SendMessageW(get_item(hwnd, CHK_HOOK), BM_SETCHECK, Some(WPARAM(d.hook_enabled as usize)), None);
                         SendMessageW(get_item(hwnd, SL_LIMIT), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(d.fps_limit as isize)));

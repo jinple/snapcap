@@ -85,7 +85,7 @@ Press **F8** (or click *Settings…*).
 
 | Setting | What it does |
 | --- | --- |
-| **Font sizes** | Scale the FPS number and the smaller text (app name, timer, hotkey legend) independently, 50–250%. Changes apply live. |
+| **Font sizes** | Scale the FPS number and the smaller text (app name, timer, hotkey legend) independently. Drag the slider or type any size from 10% to 500%. Changes apply live. |
 | **Frame limit** | Cap the focused game's frame rate, up to 240 FPS, or *Off*. See [Frame limiter](#frame-limiter). |
 | **Show overlay in recordings** | Off by default: you see the overlay, the video doesn't. Turn it on to burn the overlay into the video. This works even in exclusive fullscreen. |
 | **In-game overlay for exclusive fullscreen** | Experimental, off by default. See [Exclusive fullscreen](#exclusive-fullscreen-and-the-in-game-hook). |

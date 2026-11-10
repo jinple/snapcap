@@ -2,6 +2,10 @@
 
 Each release's section below becomes its GitHub release description.
 
+## [0.1.1] - 2026-11-10
+
+- Font sizes can be set to any value: type 10%-500% in the new box beside each slider (previously 50%-250%).
+
 ## [0.1.0] - 2026-11-10
 
 First release.
