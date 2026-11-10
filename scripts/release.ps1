@@ -97,7 +97,9 @@ Run git push origin master
 Run git push origin $tag
 
 $notesFile = New-TemporaryFile
-Set-Content $notesFile $notes -Encoding utf8
+# UTF-8 *without* a BOM (Windows PowerShell's -Encoding utf8 adds one, which shows up as a stray
+# character at the start of the GitHub release description).
+[IO.File]::WriteAllText($notesFile.FullName, $notes, (New-Object System.Text.UTF8Encoding $false))
 Run gh release create $tag $setup $hashFile --title "SnapCap $Version" --notes-file $notesFile --verify-tag
 Remove-Item $notesFile
 Write-Host "Published $tag : https://github.com/jinple/snapcap/releases/tag/$tag"
