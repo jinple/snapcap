@@ -1,0 +1,26 @@
+[package]
+name = "snapcap-hook"
+version = "0.1.0"
+edition = "2024"
+description = "SnapCap in-game overlay hook (Direct3D 11). Injected into the game on request."
+
+[lib]
+name = "snapcap_hook"
+crate-type = ["cdylib"]
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Security",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+]

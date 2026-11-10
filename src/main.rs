@@ -1,0 +1,742 @@
+//! SnapCap - featherweight gameplay recorder.
+//!
+//! Default keys (rebindable in the settings window):
+//!   F9   start / stop recording
+//!   F10  show / hide the overlay
+//!   F8   settings
+//!   F11  quit
+
+mod audio;
+mod capture;
+mod hook_client;
+mod overlay;
+mod settings;
+mod settings_ui;
+
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::time::Instant;
+
+use capture::{Job, Shared, WM_FRAME};
+use hook_client::HookClient;
+use overlay::{Renderer, Style};
+use settings::{ACTION_NAMES, Settings, key_name};
+
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::*;
+use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{BOOL, PWSTR, w};
+
+// hotkey ids are index + 1 into `Settings::keys`
+const ID_REC: i32 = 1;
+const ID_OVERLAY: i32 = 2;
+const ID_SETTINGS: i32 = 3;
+const ID_QUIT: i32 = 4;
+const TIMER: usize = 1;
+/// WDA_EXCLUDEFROMCAPTURE: the window is visible on screen but absent from captures.
+const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
+
+#[derive(Clone, PartialEq)]
+struct Target {
+    hwnd: isize,
+    pid: u32,
+    rect: (i32, i32, i32, i32),
+    name: String,
+}
+
+struct Config {
+    fps: u32,
+    bitrate: u32,
+    out_dir: std::path::PathBuf,
+    overlay: bool,
+}
+
+struct Dib {
+    dc: HDC,
+    bmp: HBITMAP,
+    bits: *mut u8,
+    w: u32,
+    h: u32,
+}
+
+pub(crate) struct App {
+    cfg: Config,
+    pub(crate) settings: Settings,
+    hints: Vec<String>,
+    /// A true exclusive-fullscreen D3D app is running: no window can draw over it.
+    exclusive: bool,
+    hook: HookClient,
+    last_excl_check: Instant,
+    renderer: Renderer,
+    shared: Arc<Shared>,
+    hwnd: HWND,
+    dib: Option<Dib>,
+    target: Option<Target>,
+    locked: bool,
+    worker: Option<JoinHandle<()>>,
+    t0: Instant,
+    last_key: Option<(u32, bool, Option<Target>, i32, bool, u64)>,
+}
+
+thread_local! { pub(crate) static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
+
+fn main() {
+    let cfg = parse_args();
+    let renderer = match Renderer::new() {
+        Ok(r) => r,
+        Err(e) => return eprintln!("error: {e}"),
+    };
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let hinst = GetModuleHandleW(None).unwrap();
+        let class = w!("SnapCapOverlay");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinst.into(),
+            lpszClassName: class,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        });
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class,
+            w!("SnapCap"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(hinst.into()),
+            None,
+        )
+        .expect("create overlay window");
+
+        let shared = Arc::new(Shared::default());
+        {
+            let (s, h) = (shared.clone(), hwnd.0 as isize);
+            std::thread::spawn(move || capture::monitor(s, h));
+        }
+        let settings = Settings::load();
+        APP.with(|a| {
+            *a.borrow_mut() = Some(App {
+                cfg,
+                settings,
+                hints: Vec::new(),
+                exclusive: false,
+                hook: HookClient::new(),
+                last_excl_check: Instant::now(),
+                renderer,
+                shared,
+                hwnd,
+                dib: None,
+                target: None,
+                locked: false,
+                worker: None,
+                t0: Instant::now(),
+                last_key: None,
+            })
+        });
+        SetTimer(Some(hwnd), TIMER, 15, None);
+
+        APP.with(|a| {
+            if let Some(app) = a.borrow_mut().as_mut() {
+                app.update_hints();
+                app.apply_visuals();
+                app.register_keys();
+                println!("SnapCap running.  {}", app.hints.join("   "));
+            }
+        });
+
+        if std::env::args().any(|a| a == "--selftest") {
+            let h = hwnd.0 as isize;
+            std::thread::spawn(move || {
+                let press = |id: i32| {
+                    let _ = PostMessageW(Some(HWND(h as _)), WM_HOTKEY, WPARAM(id as usize), LPARAM(0));
+                };
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                press(ID_REC);
+                std::thread::sleep(std::time::Duration::from_secs(4));
+                press(ID_REC);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                press(ID_QUIT);
+            });
+        }
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = DispatchMessageW(&msg);
+        }
+    }
+}
+
+fn parse_args() -> Config {
+    let mut cfg = Config {
+        fps: 60,
+        bitrate: 16,
+        out_dir: std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
+            .join("Videos")
+            .join("SnapCap"),
+        overlay: true,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--fps" => cfg.fps = args.next().and_then(|v| v.parse().ok()).unwrap_or(60).clamp(1, 240),
+            "--bitrate" => cfg.bitrate = args.next().and_then(|v| v.parse().ok()).unwrap_or(16).clamp(1, 200),
+            "--out" => {
+                if let Some(v) = args.next() {
+                    cfg.out_dir = v.into()
+                }
+            }
+            "--no-overlay" => cfg.overlay = false,
+            "--selftest" => {}
+            _ => {
+                println!(
+                    "SnapCap - featherweight recorder\n\n  --fps N        capture rate (default 60)\n  --bitrate N    Mbps (default 16)\n  --out DIR      output folder (default %USERPROFILE%\\Videos\\SnapCap)\n  --no-overlay   start with the overlay hidden\n\nDefault hotkeys: F9 record/stop, F10 overlay, F8 settings, F11 quit.\nPress the settings key to change font sizes and keybinds."
+                );
+                std::process::exit(0);
+            }
+        }
+    }
+    cfg
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER | WM_FRAME => {
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    unsafe { app.tick() }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_HOTKEY => {
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    unsafe {
+                        match wp.0 as i32 {
+                            ID_REC => app.toggle_record(),
+                            ID_OVERLAY => {
+                                app.cfg.overlay = !app.cfg.overlay;
+                                app.apply_visuals();
+                            }
+                            ID_SETTINGS => app.open_settings(),
+                            ID_QUIT => {
+                                app.shared.stop.store(true, Ordering::SeqCst);
+                                if let Some(h) = app.worker.take() {
+                                    let _ = h.join();
+                                }
+                                PostQuitMessage(0);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+impl App {
+    fn recording(&self) -> bool {
+        self.shared.recording.load(Ordering::Relaxed) && !self.shared.stop.load(Ordering::Relaxed)
+    }
+
+    fn update_hints(&mut self) {
+        self.hints = (0..4)
+            .map(|i| format!("{}: {}", key_name(self.settings.keys[i]), ACTION_NAMES[i]))
+            .collect();
+    }
+
+    unsafe fn unregister_all(&self) {
+        unsafe {
+            for id in 1..=4 {
+                let _ = UnregisterHotKey(Some(self.hwnd), id);
+            }
+        }
+    }
+
+    /// (Re)registers every global hotkey; returns the names of actions that failed.
+    unsafe fn register_now(&self) -> Vec<&'static str> {
+        unsafe {
+            self.unregister_all();
+            let mut failed = Vec::new();
+            for (i, k) in self.settings.keys.iter().enumerate() {
+                if RegisterHotKey(Some(self.hwnd), i as i32 + 1, HOT_KEY_MODIFIERS(k.mods) | MOD_NOREPEAT, k.vk)
+                    .is_err()
+                {
+                    failed.push(ACTION_NAMES[i]);
+                }
+            }
+            failed
+        }
+    }
+
+    /// Normal operation: hotkeys live. (While the settings window is open they're
+    /// released, otherwise Windows would swallow the keys you're trying to bind.)
+    pub(crate) fn register_keys(&mut self) {
+        if settings_ui::is_open() {
+            return;
+        }
+        let failed = unsafe { self.register_now() };
+        for f in failed {
+            eprintln!("warning: couldn't register the \"{f}\" hotkey (in use by another app?)");
+        }
+    }
+
+    pub(crate) fn set_keys(&mut self, keys: [settings::Key; 4]) -> Result<(), String> {
+        if let Some(e) = Settings::validate_keys(&keys) {
+            return Err(e);
+        }
+        let old = self.settings.keys;
+        self.settings.keys = keys;
+        let failed = unsafe { self.register_now() };
+        if !failed.is_empty() {
+            self.settings.keys = old;
+            unsafe { self.unregister_all() };
+            return Err(format!("Couldn't bind: {} (that key combo is already used by another app).", failed.join(", ")));
+        }
+        self.update_hints();
+        self.last_key = None;
+        Ok(())
+    }
+
+    /// Font sizes / capture-visibility changed: apply and redraw.
+    pub(crate) fn apply_visuals(&mut self) {
+        unsafe {
+            // The live window is never part of a capture; if the user wants the overlay in
+            // recordings, the recorder draws it into the frames itself (works in exclusive
+            // fullscreen too, where this window can't be shown at all).
+            let _ = SetWindowDisplayAffinity(self.hwnd, WINDOW_DISPLAY_AFFINITY(WDA_EXCLUDEFROMCAPTURE));
+            let s = &self.shared;
+            s.burn.store(self.settings.overlay_in_rec && self.cfg.overlay, Ordering::Relaxed);
+            s.counter_pct.store(self.settings.counter_pct, Ordering::Relaxed);
+            s.label_pct.store(self.settings.label_pct, Ordering::Relaxed);
+            self.last_key = None;
+            self.tick();
+        }
+    }
+
+    /// Audible feedback, used when the overlay can't be seen (exclusive fullscreen).
+    fn beep(&self, tones: &'static [(u32, u32)]) {
+        std::thread::spawn(move || {
+            for &(hz, ms) in tones {
+                let _ = unsafe { windows::Win32::System::Diagnostics::Debug::Beep(hz, ms) };
+            }
+        });
+    }
+
+    /// Polls whether a true exclusive-fullscreen Direct3D app is running.
+    unsafe fn check_exclusive(&mut self) {
+        unsafe {
+            if self.last_excl_check.elapsed().as_millis() < 500 {
+                return;
+            }
+            self.last_excl_check = Instant::now();
+            let now = windows::Win32::UI::Shell::SHQueryUserNotificationState()
+                .is_ok_and(|s| s == windows::Win32::UI::Shell::QUNS_RUNNING_D3D_FULL_SCREEN);
+            if now != self.exclusive {
+                self.exclusive = now;
+                if now {
+                    if self.settings.hook_enabled {
+                        eprintln!("exclusive fullscreen detected: using the in-game overlay hook (Direct3D 11 only).");
+                    } else {
+                        eprintln!(
+                            "exclusive fullscreen detected: Windows won't show a normal overlay window over it. \
+                             Tick \"In-game overlay for exclusive fullscreen\" in settings (F8) to draw it inside \
+                             the game, or use Borderless in the game. You'll get beeps for rec start/stop instead."
+                        );
+                    }
+                    self.beep(&[(1200, 60)]);
+                }
+            }
+        }
+    }
+
+    unsafe fn open_settings(&mut self) {
+        unsafe {
+            self.unregister_all();
+            settings_ui::open(&self.settings);
+        }
+    }
+
+    unsafe fn toggle_record(&mut self) {
+        unsafe {
+            if self.shared.recording.load(Ordering::SeqCst) {
+                self.shared.stop.store(true, Ordering::SeqCst);
+                println!("stopping...");
+                if self.exclusive {
+                    self.beep(&[(1200, 80), (800, 120)]);
+                }
+                return;
+            }
+            if self.worker.is_some() {
+                return; // previous take is still finalizing
+            }
+            let Some(t) = self.target.clone() else {
+                return println!("nothing to record (no focused window)");
+            };
+            let _ = std::fs::create_dir_all(&self.cfg.out_dir);
+            let stamp = timestamp();
+            let safe: String = t
+                .name
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            let path = self.cfg.out_dir.join(format!("{safe}_{stamp}.mp4"));
+            println!("recording {} -> {}", t.name, path.display());
+
+            self.locked = true;
+            self.shared.stop.store(false, Ordering::SeqCst);
+            self.shared.frame.store(0, Ordering::SeqCst);
+            self.shared.recording.store(true, Ordering::SeqCst);
+            let job = Job {
+                rect: RECT { left: t.rect.0, top: t.rect.1, right: t.rect.2, bottom: t.rect.3 },
+                fps: self.cfg.fps,
+                bitrate_mbps: self.cfg.bitrate,
+                path,
+                overlay: self.hwnd.0 as isize,
+                pid: t.pid,
+                name: t.name.clone(),
+                hook_pid: if self.settings.hook_enabled && t.pid != 0 && self.hook.alive(t.pid) { t.pid } else { 0 },
+            };
+            let shared = self.shared.clone();
+            self.worker = Some(std::thread::spawn(move || capture::run(job, shared)));
+            if self.exclusive {
+                self.beep(&[(800, 80), (1200, 120)]);
+            }
+            self.last_key = None;
+            self.tick();
+        }
+    }
+
+    unsafe fn tick(&mut self) {
+        unsafe {
+            // reap a finished worker
+            if self.worker.as_ref().is_some_and(|h| h.is_finished()) {
+                let _ = self.worker.take().unwrap().join();
+                self.shared.stop.store(false, Ordering::SeqCst);
+                self.locked = false;
+                if self.shared.failed.swap(false, Ordering::SeqCst) {
+                    self.beep(&[(300, 180), (250, 300)]); // always audible: the take was lost
+                }
+            }
+            self.check_exclusive();
+            // Games often grab HWND_TOPMOST themselves; keep re-asserting ours so the
+            // overlay doesn't end up underneath a fullscreen-optimized game window.
+            if self.cfg.overlay && self.target.is_some() {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            if !self.locked {
+                if let Some(t) = foreground_target(self.hwnd) {
+                    self.target = Some(t);
+                }
+            }
+            let Some(target) = self.target.clone() else { return };
+
+            // In-game hook (opt-in, exclusive fullscreen D3D11 only): engage it, keep it
+            // alive, and use the game's real Present rate for the FPS readout.
+            let mut hook_live = false;
+            let mut game_fps10 = 0;
+            if self.settings.hook_enabled && target.pid != 0 {
+                if self.exclusive {
+                    self.hook.ensure(target.pid);
+                }
+                self.hook.heartbeat(target.pid);
+                hook_live = self.hook.alive(target.pid);
+                if hook_live {
+                    game_fps10 = self.hook.fps10(target.pid);
+                }
+            }
+            self.shared.hook_fps10.store(game_fps10, Ordering::Relaxed);
+
+            let rec = self.recording();
+            let time = self.t0.elapsed().as_secs_f32();
+            let f10 = if game_fps10 > 0 { game_fps10 } else { self.shared.fps10.load(Ordering::Relaxed) };
+            let fps = (f10 + 5) / 10;
+            let elapsed = if rec { self.shared.elapsed.load(Ordering::Relaxed) } else { 0 };
+            self.shared.watch_x.store((target.rect.0 + target.rect.2) / 2, Ordering::Relaxed);
+            self.shared.watch_y.store((target.rect.1 + target.rect.3) / 2, Ordering::Relaxed);
+            let pulse_bucket = if rec { (time * 60.0) as i32 } else { 0 };
+            let key = (fps, rec, Some(target.clone()), pulse_bucket, self.cfg.overlay, elapsed);
+            if self.last_key.as_ref() == Some(&key) {
+                return;
+            }
+            self.last_key = Some(key);
+
+            if !self.cfg.overlay {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if hook_live {
+                    self.hook.set_enabled(target.pid, false);
+                }
+                return;
+            }
+
+            let height = (target.rect.3 - target.rect.1) as f32;
+            let scale = ((height / 1080.0).clamp(0.6, 2.0) * 20.0).round() / 20.0;
+            let cs = self.settings.counter_pct as f32 / 100.0;
+            let ls = self.settings.label_pct as f32 / 100.0;
+            let (cw, ch) = Renderer::canvas(scale, cs.max(ls));
+            if self.dib.as_ref().is_none_or(|d| d.w != cw || d.h != ch) {
+                self.dib = Some(make_dib(cw, ch));
+            }
+            let dib = self.dib.as_ref().unwrap();
+            let style = Style {
+                fps,
+                elapsed,
+                recording: rec,
+                counter_scale: cs,
+                label_scale: ls,
+                hints: &self.hints,
+                name: &target.name,
+                time,
+            };
+            let pm = self.renderer.render(&style, scale);
+
+            // tiny-skia: premultiplied RGBA  ->  layered window: premultiplied BGRA
+            let src = pm.data();
+            let dst = std::slice::from_raw_parts_mut(dib.bits, src.len());
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+
+            let margin = (18.0 * scale) as i32;
+            if hook_live {
+                // Drawn inside the game itself; our own window would be redundant.
+                let bytes = std::slice::from_raw_parts(dib.bits, (cw * ch * 4) as usize);
+                self.hook.publish(target.pid, bytes, cw, ch, margin, margin);
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                return;
+            }
+            let pos = POINT { x: target.rect.0 + margin, y: target.rect.1 + margin };
+            let size = SIZE { cx: cw as i32, cy: ch as i32 };
+            let src_pt = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&pos),
+                Some(&size),
+                Some(dib.dc),
+                Some(&src_pt),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+}
+
+unsafe fn make_dib(w: u32, h: u32) -> Dib {
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32), // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+        SelectObject(dc, bmp.into());
+        Dib { dc, bmp, bits: bits as *mut u8, w, h }
+    }
+}
+
+impl Drop for Dib {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.dc);
+            let _ = DeleteObject(self.bmp.into());
+        }
+    }
+}
+
+/// The window we should be recording: whatever is focused (not ourselves).
+unsafe fn foreground_target(own: HWND) -> Option<Target> {
+    unsafe {
+        let focused = GetForegroundWindow();
+        let mut fpid = 0u32;
+        if !focused.0.is_null() {
+            GetWindowThreadProcessId(focused, Some(&mut fpid));
+        }
+        if focused == own || (fpid != 0 && fpid == GetCurrentProcessId()) {
+            return None; // our own settings window: keep the previous target
+        }
+        // What the user is actually looking at beats what has keyboard focus: if a
+        // fullscreen window is on top of the focused one, that's the target.
+        let fg = find_fullscreen_above(focused).unwrap_or(focused);
+        if fg.0.is_null() || IsIconic(fg).as_bool() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(fg, &mut cls) as usize;
+        let class = String::from_utf16_lossy(&cls[..n]);
+        let desktop = matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd");
+
+        let mut r = RECT::default();
+        if desktop {
+            let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                r = mi.rcMonitor;
+            }
+        } else if DwmGetWindowAttribute(
+            fg,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut r as *mut _ as *mut _,
+            size_of::<RECT>() as u32,
+        )
+        .is_err()
+        {
+            GetWindowRect(fg, &mut r).ok()?;
+        }
+        if r.right - r.left < 64 || r.bottom - r.top < 64 {
+            return None;
+        }
+        let name = if desktop { "Desktop".to_string() } else { process_name(pid) };
+        // the desktop shell's audio is not "the app", so don't capture explorer.exe
+        let pid = if desktop { 0 } else { pid };
+        Some(Target { hwnd: fg.0 as isize, pid, rect: (r.left, r.top, r.right, r.bottom), name })
+    }
+}
+
+struct Scan {
+    stop: HWND,
+    own_pid: u32,
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> BOOL {
+    unsafe {
+        let s = &mut *(lp.0 as *mut Scan);
+        if h == s.stop {
+            return FALSE; // reached the focused window: nothing fullscreen above it
+        }
+        if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() {
+            return TRUE;
+        }
+        // skip click-through / tool / no-activate windows: other apps' overlays
+        // (GPU overlays, Game Bar, our own) often span the whole monitor
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0) != 0 {
+            return TRUE;
+        }
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
+        if cloaked != 0 {
+            return TRUE;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == s.own_pid {
+            return TRUE;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(h, &mut cls) as usize;
+        let class = String::from_utf16_lossy(&cls[..n]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return TRUE;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r).is_err() {
+            return TRUE;
+        }
+        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let m = mi.rcMonitor;
+            if r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom {
+                s.found = Some(h);
+                return FALSE;
+            }
+        }
+        TRUE
+    }
+}
+
+/// Topmost fullscreen window that sits above `focused` in z-order (EnumWindows walks
+/// top to bottom, so we stop as soon as we reach the focused window).
+unsafe fn find_fullscreen_above(focused: HWND) -> Option<HWND> {
+    unsafe {
+        let mut s = Scan { stop: focused, own_pid: GetCurrentProcessId(), found: None };
+        let _ = EnumWindows(Some(scan_cb), LPARAM(&mut s as *mut Scan as isize));
+        s.found
+    }
+}
+
+unsafe fn process_name(pid: u32) -> String {
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut buf = [0u16; 520];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+            let _ = CloseHandle(h);
+            if ok.is_ok() {
+                let p = String::from_utf16_lossy(&buf[..len as usize]);
+                if let Some(stem) = std::path::Path::new(&p).file_stem() {
+                    return stem.to_string_lossy().into_owned();
+                }
+            }
+        }
+        "Unknown".into()
+    }
+}
+
+fn timestamp() -> String {
+    // local-ish timestamp without pulling in a date crate
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
