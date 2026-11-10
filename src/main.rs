@@ -540,11 +540,14 @@ impl App {
 
             let margin = (18.0 * scale) as i32;
             if hook_live {
-                // Drawn inside the game itself; our own window would be redundant.
                 let bytes = std::slice::from_raw_parts(dib.bits, (cw * ch * 4) as usize);
                 self.hook.publish(target.pid, bytes, cw, ch, margin, margin);
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-                return;
+                // Once the hook is really drawing inside the game, our own window is redundant.
+                // Until then (or if the hook can't draw) keep showing the normal overlay.
+                if self.hook.drawing(target.pid) {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    return;
+                }
             }
             let pos = POINT { x: target.rect.0 + margin, y: target.rect.1 + margin };
             let size = SIZE { cx: cw as i32, cy: ch as i32 };

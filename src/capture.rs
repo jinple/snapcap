@@ -137,6 +137,13 @@ unsafe fn open_hook_src(device: &ID3D11Device, pid: u32) -> std::result::Result<
     }
 }
 
+thread_local! { static STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("starting") }; }
+
+/// Remembers what the recorder is doing, so a failure says *where* it happened.
+fn stage(s: &'static str) {
+    STAGE.set(s);
+}
+
 pub fn run(job: Job, shared: Arc<Shared>) {
     let res = unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -151,7 +158,7 @@ pub fn run(job: Job, shared: Arc<Shared>) {
     match res {
         Ok(n) => println!("saved {n} frames -> {}", job.path.display()),
         Err(e) => {
-            eprintln!("recording failed: {e}");
+            eprintln!("recording failed while {}: {e}", STAGE.get());
             shared.failed.store(true, Ordering::SeqCst);
         }
     }
@@ -343,7 +350,9 @@ unsafe fn duplicate(output: &IDXGIOutput, device: &ID3D11Device) -> Result<IDXGI
 unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
     unsafe {
         let r = job.rect;
+        stage("finding the monitor");
         let (adapter, output, out) = find_output((r.left + r.right) / 2, (r.top + r.bottom) / 2)?;
+        stage("creating the capture device");
 
         let mut device = None;
         let mut ctx = None;
@@ -361,11 +370,8 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
         let device = device.unwrap();
         let ctx = ctx.unwrap();
 
-        let mut dup = duplicate(&output, &device)?;
-        let md = dup.GetDesc().ModeDesc;
-        let (mon_w, mon_h) = (md.Width, md.Height);
-
         // Prefer overlay-free frames straight from the game (in-game hook), if it's running.
+        stage("opening the in-game frame source");
         let hook = if job.hook_pid != 0 {
             match open_hook_src(&device, job.hook_pid) {
                 Ok(s) => {
@@ -381,6 +387,17 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             None
         };
 
+        // Screen duplication is only needed when the hook isn't supplying frames; it can fail on
+        // its own in exclusive fullscreen, so don't make it a hard requirement in hook mode.
+        let (mut dup, mon_w, mon_h) = if hook.is_some() {
+            (None, (out.right - out.left) as u32, (out.bottom - out.top) as u32)
+        } else {
+            stage("duplicating the screen");
+            let d = duplicate(&output, &device)?;
+            let md = d.GetDesc().ModeDesc;
+            (Some(d), md.Width, md.Height)
+        };
+
         // Crop region (relative to the monitor), even-sized for H.264.
         let (x0, y0, w, h) = if let Some(hs) = hook.as_ref() {
             (0, 0, (hs.w & !1).max(2), (hs.h & !1).max(2))
@@ -393,6 +410,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
         };
         let stage_fmt = hook.as_ref().map(|s| s.fmt).unwrap_or(DXGI_FORMAT_B8G8R8A8_UNORM);
 
+        stage("creating capture textures");
         let tex_desc = |w, h, usage, cpu: D3D11_CPU_ACCESS_FLAG, fmt: DXGI_FORMAT| D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -440,6 +458,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
         } else {
             None
         };
+        stage("creating the MP4 encoder");
         let (sink, stream, astream) = create_writer(job, w, h, audio.is_some())?;
         // shared recording clock: starts only once audio + encoder are ready
         let t0 = Instant::now();
@@ -495,7 +514,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             let mut res: Option<IDXGIResource> = None;
             let timeout = if have_frame { 0 } else { 250 };
             if hook.is_none() {
-            match dup.AcquireNextFrame(timeout, &mut info, &mut res) {
+            match dup.as_ref().unwrap().AcquireNextFrame(timeout, &mut info, &mut res) {
                 Ok(()) => {
                     meter.add(info.AccumulatedFrames, shared, job.overlay);
                     if let Some(res) = res.as_ref() {
@@ -504,7 +523,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
                             have_frame = true;
                         }
                     }
-                    let _ = dup.ReleaseFrame();
+                    let _ = dup.as_ref().unwrap().ReleaseFrame();
                 }
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
@@ -517,7 +536,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
                             if (m.Width, m.Height) != (mon_w, mon_h) {
                                 break;
                             }
-                            dup = d;
+                            dup = Some(d);
                             ok = true;
                             break;
                         }
@@ -563,9 +582,11 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             let t_cap = cap_t[rslot];
             let staging = &stagings[rslot];
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            stage("reading a captured frame");
             ctx.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let t_b = Instant::now();
 
+            stage("allocating a video buffer");
             let buf = MFCreateMemoryBuffer(row as u32 * h)?;
             let mut dst = std::ptr::null_mut();
             buf.Lock(&mut dst, None, None)?;
@@ -615,6 +636,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             // real capture time, so video stays in sync with audio (no nominal-fps drift)
             sample.SetSampleTime((t_cap - t0).as_nanos() as i64 / 100)?;
             sample.SetSampleDuration(sample_dur)?;
+            stage("encoding a frame");
             sink.WriteSample(stream, &sample)?;
             if let (Some(a), Some(s)) = (audio.as_ref(), astream) {
                 drain_audio(&sink, s, a)?;
@@ -653,6 +675,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
                 drain_audio(&sink, s, a)?;
             }
         }
+        stage("finishing the file");
         sink.Finalize()?;
         if std::env::var_os("SNAPCAP_STATS").is_some() && idx > 0 {
             let n = idx as f64;

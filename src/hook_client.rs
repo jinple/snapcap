@@ -28,6 +28,8 @@ struct Map {
 pub struct HookClient {
     maps: std::collections::HashMap<u32, Map>,
     tried: HashSet<u32>,
+    /// pid -> (last `drawn` counter, when it last changed)
+    drawn_seen: std::collections::HashMap<u32, (u64, Option<Instant>)>,
     dll: PathBuf,
     // FPS derivation from the hook's Present counter
     last_presents: u64,
@@ -49,6 +51,7 @@ impl HookClient {
         Self {
             maps: Default::default(),
             tried: HashSet::new(),
+            drawn_seen: Default::default(),
             dll,
             last_presents: 0,
             last_at: Instant::now(),
@@ -65,30 +68,59 @@ impl HookClient {
     /// injects the hook DLL (once per process). Returns a short status message.
     pub unsafe fn ensure(&mut self, pid: u32) {
         unsafe {
-            if !self.maps.contains_key(&pid) {
-                let name = wide(&map_name(pid));
-                let Ok(h) = CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, MAP_SIZE as u32, PCWSTR(name.as_ptr()))
-                else {
-                    return;
-                };
-                let view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, MAP_SIZE);
-                if view.Value.is_null() {
-                    let _ = CloseHandle(h);
-                    return;
-                }
-                let hdr = view.Value as *mut Header;
-                std::ptr::write_bytes(view.Value as *mut u8, 0, size_of::<Header>());
-                (*hdr).magic = MAGIC;
-                (*hdr).version = 1;
-                self.maps.insert(pid, Map { _handle: h, view: view.Value as *mut u8 });
+            if !self.tried.insert(pid) {
+                return; // decided once per process
             }
-            if self.tried.insert(pid) {
-                self.status = match self.inject(pid) {
-                    Ok(()) => "hook injected".into(),
-                    Err(e) => format!("hook not injected: {e}"),
-                };
-                eprintln!("in-game overlay: {}", self.status);
+            self.status = match self.attach(pid) {
+                Ok(()) => "hook injected".into(),
+                Err(e) => format!("hook not injected: {e}"),
+            };
+            eprintln!("in-game overlay: {}", self.status);
+        }
+    }
+
+    /// Vet the process first; only a process that passes gets a shared block (a hook that is
+    /// already resident somewhere must never find a block for a process we refused) and the DLL.
+    unsafe fn attach(&mut self, pid: u32) -> Result<(), String> {
+        unsafe {
+            if !self.dll.exists() {
+                return Err(format!("{} not found next to snapcap.exe", self.dll.display()));
             }
+            let access = PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ;
+            let proc = OpenProcess(access, false, pid).map_err(|e| format!("can't open the process ({e}); is it running as admin?"))?;
+            let res = (|| {
+                self.vet(proc)?;
+                self.create_map(pid)?;
+                self.load(proc)
+            })();
+            let _ = CloseHandle(proc);
+            res
+        }
+    }
+
+    unsafe fn create_map(&mut self, pid: u32) -> Result<(), String> {
+        unsafe {
+            if self.maps.contains_key(&pid) {
+                return Ok(());
+            }
+            let name = wide(&map_name(pid));
+            let h = CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, MAP_SIZE as u32, PCWSTR(name.as_ptr()))
+                .map_err(|e| format!("can't create the shared block ({e})"))?;
+            let view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, MAP_SIZE);
+            if view.Value.is_null() {
+                let _ = CloseHandle(h);
+                return Err("can't map the shared block".into());
+            }
+            let hdr = view.Value as *mut Header;
+            std::ptr::write_bytes(view.Value as *mut u8, 0, size_of::<Header>());
+            (*hdr).magic = MAGIC;
+            (*hdr).version = 1;
+            self.maps.insert(pid, Map { _handle: h, view: view.Value as *mut u8 });
+            Ok(())
         }
     }
 
@@ -125,6 +157,20 @@ impl HookClient {
             let hp = std::ptr::read_volatile(&raw const (*h).hook_pid);
             let tick = std::ptr::read_volatile(&raw const (*h).hook_tick);
             hp == pid && GetTickCount64().saturating_sub(tick) < 1500
+        }
+    }
+
+    /// True once the hook has *actually drawn* the overlay recently. Until then (or if its
+    /// graphics setup failed) SnapCap keeps showing its own overlay window instead.
+    pub unsafe fn drawing(&mut self, pid: u32) -> bool {
+        unsafe {
+            let Some(h) = self.hdr(pid) else { return false };
+            let d = std::ptr::read_volatile(&raw const (*h).drawn);
+            let e = self.drawn_seen.entry(pid).or_insert((d, None));
+            if d != e.0 {
+                *e = (d, Some(Instant::now()));
+            }
+            e.1.is_some_and(|t| t.elapsed().as_millis() < 1500)
         }
     }
 
@@ -176,30 +222,35 @@ impl HookClient {
         }
     }
 
-    unsafe fn inject(&self, pid: u32) -> Result<(), String> {
-        unsafe {
-            if !self.dll.exists() {
-                return Err(format!("{} not found next to snapcap.exe", self.dll.display()));
-            }
-            let access = PROCESS_CREATE_THREAD
-                | PROCESS_QUERY_INFORMATION
-                | PROCESS_VM_OPERATION
-                | PROCESS_VM_WRITE
-                | PROCESS_VM_READ;
-            let proc = OpenProcess(access, false, pid).map_err(|e| format!("can't open the game process ({e}); is it running as admin?"))?;
-            let res = self.inject_into(proc);
-            let _ = CloseHandle(proc);
-            res
-        }
-    }
-
-    unsafe fn inject_into(&self, proc: HANDLE) -> Result<(), String> {
+    /// Safety checks: is this process one we're willing to inject into?
+    unsafe fn vet(&self, proc: HANDLE) -> Result<(), String> {
         unsafe {
             // 64-bit games only (our DLL is 64-bit)
             let mut wow = BOOL(0);
             let _ = IsWow64Process(proc, &mut wow);
             if wow.as_bool() {
                 return Err("32-bit game: not supported".into());
+            }
+
+            // Never touch anything that isn't a game: the Windows shell, system processes,
+            // browsers and Electron apps (which also use Direct3D 11 and would otherwise qualify).
+            let mut exe_buf = [0u16; 260];
+            let exe_len = K32GetModuleBaseNameW(proc, None, &mut exe_buf) as usize;
+            let exe = String::from_utf16_lossy(&exe_buf[..exe_len]).to_ascii_lowercase();
+            const NOT_GAMES: &[&str] = &[
+                // Windows shell / system
+                "explorer.exe", "dwm.exe", "sihost.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+                "searchhost.exe", "searchapp.exe", "applicationframehost.exe", "textinputhost.exe", "taskmgr.exe",
+                "systemsettings.exe", "widgets.exe", "lockapp.exe", "winlogon.exe", "csrss.exe", "svchost.exe",
+                // browsers and Chromium/Electron apps
+                "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "vivaldi.exe", "arc.exe",
+                "code.exe", "claude.exe", "discord.exe", "slack.exe", "teams.exe", "ms-teams.exe", "whatsapp.exe",
+                "spotify.exe", "notion.exe", "figma.exe", "obsidian.exe", "postman.exe",
+                // other tools that render with D3D11 and must not be patched
+                "obs64.exe", "obs32.exe", "devenv.exe", "unityhub.exe", "unity.exe", "snapcap.exe",
+            ];
+            if exe.is_empty() || NOT_GAMES.contains(&exe.as_str()) {
+                return Err(format!("{exe}: not a game, never injected"));
             }
 
             // Look at what the game has loaded: refuse anti-cheat, and require plain D3D11.
@@ -220,6 +271,10 @@ impl HookClient {
                     {
                         return Err(format!("anti-cheat detected ({name}); refusing to inject"));
                     }
+                    // Chromium / Electron / CEF runtimes (any exe name): not a game
+                    if ["chrome_elf.dll", "libcef.dll", "libglesv2.dll", "libegl.dll", "electron.exe"].contains(&name.as_str()) {
+                        return Err(format!("{exe}: Chromium/Electron app, never injected"));
+                    }
                     d3d11 |= name == "d3d11.dll";
                     d3d12 |= name == "d3d12.dll";
                 }
@@ -230,7 +285,12 @@ impl HookClient {
                     return Err("game doesn't use Direct3D 11 (Vulkan/OpenGL/other): not supported".into());
                 }
             }
+            Ok(())
+        }
+    }
 
+    unsafe fn load(&self, proc: HANDLE) -> Result<(), String> {
+        unsafe {
             let path = wide(&self.dll.to_string_lossy());
             let bytes = path.len() * 2;
             let remote = VirtualAllocEx(proc, None, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
