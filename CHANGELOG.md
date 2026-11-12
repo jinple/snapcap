@@ -2,6 +2,19 @@
 
 Each release's section below becomes its GitHub release description.
 
+## [0.2.0] - 2026-11-12
+
+Much lighter recording, and support for Unreal Engine games.
+
+- **GPU recording.** Frames are now converted on the GPU (D3D11 video processor, including the burned-in overlay) and handed straight to the hardware encoder, instead of being read back and converted on the CPU. CPU use while recording at 1080p60 dropped from about 130% to about 23% of a core, so games lose far fewer frames. New setting **Encode recordings on the GPU** (on by default); turn it off to use the previous CPU path. If the GPU setup isn't supported, SnapCap falls back to the CPU path by itself.
+- **10-bit back buffers.** The in-game hook now handles `R10G10B10A2` swap chains (Unreal Engine's default), for both the in-game overlay and clean recording frames.
+- **Unreal games that also load `d3d12.dll`** (for example through DLSS/Streamline) are no longer mistaken for Direct3D 12 games when they render with Direct3D 11.
+- **Restart in DX11.** For an Unreal game running Direct3D 12 (which the hook can't use), SnapCap offers to close it and relaunch it with `-dx11`: a button in the control window, and an **F7** prompt in the overlay while the game is focused. It always asks first.
+- Less overhead while idle and recording: the screen-duplication monitor pauses when the hook reports the game's frame rate, the overlay is re-rendered about 15 times a second instead of per frame, the UI timer runs at about 15 Hz, and the overlay window's topmost re-assert is throttled.
+- Fewer in-game GPU stalls: the hook copies a clean frame for the recorder only when asked (once per recorded frame) instead of on every present.
+- The hook writes a short timing line to `%TEMP%\snapcap_hook.log` every few seconds (presents per second, its own cost, overlay and recording state) to help diagnose performance.
+- Recordings now use the frames' real capture times (variable frame rate on the GPU path).
+
 ## [0.1.1] - 2026-11-10
 
 - Font sizes can be set to any value: type 10%-500% in the new box beside each slider (previously 50%-250%).

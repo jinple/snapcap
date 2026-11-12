@@ -18,7 +18,7 @@
 
 ## Why SnapCap
 
-- **Tiny and fast.** One ~1&nbsp;MB exe, no ffmpeg, no runtime to install. Hardware H.264 encoding; in testing it holds 60&nbsp;fps at 4K (RTX&nbsp;3080).
+- **Tiny and fast.** One ~1&nbsp;MB exe, no ffmpeg, no runtime to install. Hardware H.264 encoding, with frames converted on the GPU (about a quarter of a CPU core at 1080p60); in testing it holds 60&nbsp;fps at 4K (RTX&nbsp;3080).
 - **The FPS counter is the point.** Big, bold, white with a black outline when idle; red with a pulsing dot when recording, like a LIVE sign. The app name and a REC timer sit underneath.
 - **Only the game's sound.** Audio comes from the app you're recording (and its child processes), not your music, chat or notifications.
 - **Works over exclusive fullscreen.** Most overlays can't. SnapCap can burn its overlay into the video in software, and (opt-in, Direct3D&nbsp;11) draw it inside the game itself.
@@ -88,6 +88,7 @@ Press **F8** (or click *Settings…*).
 | **Font sizes** | Scale the FPS number and the smaller text (app name, timer, hotkey legend) independently. Drag the slider or type any size from 10% to 500%. Changes apply live. |
 | **Frame limit** | Cap the focused game's frame rate, up to 240 FPS, or *Off*. See [Frame limiter](#frame-limiter). |
 | **Show overlay in recordings** | Off by default: you see the overlay, the video doesn't. Turn it on to burn the overlay into the video. This works even in exclusive fullscreen. |
+| **Encode recordings on the GPU** | On by default. Frames are converted on the GPU and go straight to the hardware encoder, which uses far less CPU so the game loses fewer frames. Turn it off to use the older CPU path if recordings look wrong. SnapCap also falls back to it by itself if the GPU path isn't supported. |
 | **In-game overlay for exclusive fullscreen** | Experimental, off by default. See [Exclusive fullscreen](#exclusive-fullscreen-and-the-in-game-hook). |
 | **Keybinds** | Click a box and press the combo you want. Letters and numbers need Ctrl/Alt/Shift; function keys can be used alone. SnapCap warns about duplicates and keys another app already owns. |
 
@@ -152,6 +153,8 @@ SnapCap is a GUI app, but when started from a terminal it prints to that termina
 | Problem | What to try |
 | --- | --- |
 | **Overlay is missing over a game** | Check the game isn't in *exclusive* fullscreen. Switch it to borderless, or enable the in-game overlay (Direct3D 11) or *Show overlay in recordings*. |
+| **Unreal game on Direct3D 12** | The in-game hook only supports Direct3D 11. While such a game is focused, SnapCap offers **F7: Restart game in DX11** in the overlay (and a button in its window) that relaunches it with `-dx11` after you confirm. Not every build ships Direct3D 11 shaders. |
+| **Game loses frames while recording** | Make sure *Encode recordings on the GPU* is on, and use the in-game hook (Direct3D 11) so frames come straight from the game. `%TEMP%\snapcap_hook.log` shows presents per second with overlay and recording on or off. |
 | **"Recording failed while …"** | The control window names the step that failed. Please [open an issue](https://github.com/jinple/snapcap/issues) with that line and your GPU/Windows version. |
 | **The recording has no audio** | Per-app audio needs Windows 10 2004+. Recording the desktop has no audio by design, and the app has to have been playing sound in that window's process. |
 | **A hotkey doesn't work** | Another app may own that combo. SnapCap tells you when you save a binding it couldn't register. Pick another in settings. |
@@ -178,7 +181,9 @@ cargo build --release     # builds snapcap.exe and snapcap_hook.dll into target\
 | Path | What it is |
 | --- | --- |
 | `src/main.rs` | App state, window messages, hotkeys, target selection (fullscreen-on-top, else focus), overlay window |
-| `src/capture.rs` | DXGI desktop duplication → Media Foundation H.264/MP4; high-resolution pacing; staging ring so the CPU never stalls on the GPU; software overlay burn-in |
+| `src/capture.rs` | DXGI desktop duplication or the hook's frames → Media Foundation H.264/MP4; high-resolution pacing; CPU fallback path (staging ring, software overlay burn-in) |
+| `src/gpuenc.rs` | The GPU path: D3D11 video processor converts frames (10-bit or 8-bit RGB) to NV12 and composites the overlay; the encoder reads the textures directly |
+| `src/relaunch.rs` | "Restart in DX11" for Unreal games on Direct3D 12 |
 | `src/audio.rs` | WASAPI process-loopback capture of the target process tree, on a clock shared with video |
 | `src/overlay.rs` | Overlay renderer (glyph outlines with `tiny-skia`, so the outline is properly anti-aliased) |
 | `src/main_window.rs` | The control window, taskbar badge and status text |

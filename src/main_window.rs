@@ -23,6 +23,7 @@ const BTN_REC: i32 = 210;
 const BTN_SETTINGS: i32 = 211;
 const BTN_FOLDER: i32 = 212;
 const BTN_QUIT: i32 = 213;
+const BTN_DX11: i32 = 214;
 
 thread_local! {
     static FONT: Cell<isize> = const { Cell::new(0) };
@@ -60,6 +61,7 @@ pub struct MainWindow {
     hints: String,
     rec_btn: String,
     badge: Option<bool>,
+    dx11_shown: bool,
 }
 
 /// Gives a window SnapCap's icon (the one embedded in the exe), at the sizes Windows asks for.
@@ -143,7 +145,7 @@ pub unsafe fn create(start_minimized: bool) -> MainWindow {
 
         let k = GetDpiForSystem() as f32 / 96.0;
         let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut r = RECT { left: 0, top: 0, right: (400.0 * k) as i32, bottom: (214.0 * k) as i32 };
+        let mut r = RECT { left: 0, top: 0, right: (400.0 * k) as i32, bottom: (254.0 * k) as i32 };
         let _ = AdjustWindowRectEx(&mut r, style, false, WINDOW_EX_STYLE(0));
         let (ww, wh) = (r.right - r.left, r.bottom - r.top);
         let x = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
@@ -170,6 +172,7 @@ pub unsafe fn create(start_minimized: bool) -> MainWindow {
             hints: String::new(),
             rec_btn: String::new(),
             badge: None,
+            dx11_shown: false,
         }
     }
 }
@@ -179,6 +182,19 @@ impl MainWindow {
     pub fn taskbar_created(&mut self) {
         self.taskbar_ready = true;
         self.badge = None;
+    }
+
+    /// Shows or hides the "Restart in DX11" button (only touches Windows when it changes).
+    pub unsafe fn set_dx11(&mut self, show: bool) {
+        unsafe {
+            if self.dx11_shown == show {
+                return;
+            }
+            self.dx11_shown = show;
+            if let Ok(b) = GetDlgItem(Some(self.hwnd), BTN_DX11) {
+                let _ = ShowWindow(b, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            }
+        }
     }
 
     unsafe fn set_text(&self, id: i32, text: &str) {
@@ -285,7 +301,31 @@ unsafe fn create_controls(hwnd: HWND) {
         child(hwnd, btn, "Settings\u{2026}", tab, (204, 88, 180, 32), BTN_SETTINGS, k);
         child(hwnd, btn, "Open recordings folder", tab, (16, 128, 180, 32), BTN_FOLDER, k);
         child(hwnd, btn, "Quit SnapCap", tab, (204, 128, 180, 32), BTN_QUIT, k);
-        child(hwnd, stat, "", 0, (16, 174, 368, 34), ST_HINTS, k);
+        let dx = child(hwnd, btn, "Restart game in DX11 (enables the overlay)", tab, (16, 168, 368, 32), BTN_DX11, k);
+        let _ = ShowWindow(dx, SW_HIDE); // only shown for Unreal games running Direct3D 12
+        child(hwnd, stat, "", 0, (16, 214, 368, 34), ST_HINTS, k);
+    }
+}
+
+/// Asks "close the game and start it again with -dx11?" and, on Yes, does it. Shown on top of
+/// the game (this is reached from a hotkey while the game has focus). Must be called with the
+/// app *not* borrowed: the message box runs its own message loop and the timer needs the app.
+pub unsafe fn confirm_restart(owner: Option<HWND>) {
+    unsafe {
+        let Some(Some(name)) = with_app(|app| app.dx11_prompt()) else { return };
+        let text = wide(&format!(
+            "Close {name} and start it again with -dx11 (Direct3D 11)?\n\n\
+             Unsaved progress in the game will be lost, and not every game supports this switch."
+        ));
+        let r = MessageBoxW(
+            owner,
+            PCWSTR(text.as_ptr()),
+            w!("Restart in DX11"),
+            MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+        if r == IDYES {
+            with_app(|app| app.restart_dx11());
+        }
     }
 }
 
@@ -321,6 +361,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         BTN_QUIT => {
                             with_app(|app| app.quit());
                         }
+                        BTN_DX11 => confirm_restart(Some(hwnd)),
                         _ => {}
                     }
                 }

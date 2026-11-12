@@ -44,6 +44,10 @@ pub struct Header {
     pub bb_h: u32,
     /// Bumped each time a fresh pre-overlay frame was copied for the recorder.
     pub frame_seq: u64,
+    // ---- SnapCap -> hook (appended) ----
+    /// Recorder sets 1 when it wants one more clean frame; the hook clears it after copying.
+    /// Keeps the (pipeline-stalling) shared copy at the recording rate, not the game's.
+    pub want_frame: u32,
 }
 
 pub fn map_name(pid: u32) -> String {

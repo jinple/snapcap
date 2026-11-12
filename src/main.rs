@@ -12,9 +12,11 @@
 
 mod audio;
 mod capture;
+mod gpuenc;
 mod hook_client;
 mod main_window;
 mod overlay;
+mod relaunch;
 mod settings;
 mod settings_ui;
 
@@ -44,6 +46,8 @@ const ID_REC: i32 = 1;
 const ID_OVERLAY: i32 = 2;
 const ID_SETTINGS: i32 = 3;
 const ID_QUIT: i32 = 4;
+/// F7: "restart the game in DX11". Registered only while an Unreal game on Direct3D 12 is focused.
+const ID_DX11: i32 = 5;
 const TIMER: usize = 1;
 /// WDA_EXCLUDEFROMCAPTURE: the window is visible on screen but absent from captures.
 const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
@@ -85,6 +89,7 @@ pub(crate) struct App {
     exclusive: bool,
     hook: HookClient,
     last_excl_check: Instant,
+    last_topmost: Instant,
     renderer: Renderer,
     shared: Arc<Shared>,
     hwnd: HWND,
@@ -94,6 +99,13 @@ pub(crate) struct App {
     worker: Option<JoinHandle<()>>,
     t0: Instant,
     last_key: Option<(u32, bool, Option<Target>, i32, bool, u64)>,
+    /// Process we last checked for "Unreal game on Direct3D 12", when, and the restart plan if so.
+    dx12_pid: u32,
+    dx12_checked: Instant,
+    dx12_plan: Option<relaunch::Plan>,
+    /// The F7 hotkey for the restart is currently registered (and advertised in the overlay).
+    dx11_hotkey: bool,
+    dx11_wanted: bool,
 }
 
 thread_local! { pub(crate) static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
@@ -172,6 +184,7 @@ fn main() {
                 exclusive: false,
                 hook: HookClient::new(),
                 last_excl_check: Instant::now(),
+                last_topmost: Instant::now(),
                 renderer,
                 shared,
                 hwnd,
@@ -181,9 +194,14 @@ fn main() {
                 worker: None,
                 t0: Instant::now(),
                 last_key: None,
+                dx12_pid: 0,
+                dx12_checked: Instant::now(),
+                dx12_plan: None,
+                dx11_hotkey: false,
+                dx11_wanted: false,
             })
         });
-        SetTimer(Some(hwnd), TIMER, 15, None);
+        SetTimer(Some(hwnd), TIMER, 66, None); // ~15 Hz is plenty for status/overlay upkeep
 
         APP.with(|a| {
             if let Some(app) = a.borrow_mut().as_mut() {
@@ -258,6 +276,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     unsafe { app.tick() }
                 }
             });
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 as i32 == ID_DX11 => {
+            // outside the APP borrow: the confirmation box runs a nested message loop
+            unsafe { main_window::confirm_restart(None) };
             LRESULT(0)
         }
         WM_HOTKEY => {
@@ -446,11 +469,73 @@ impl App {
                 pid: t.pid,
                 name: t.name.clone(),
                 hook_pid: if self.settings.hook_enabled && t.pid != 0 && self.hook.alive(t.pid) { t.pid } else { 0 },
+                gpu: self.settings.gpu_encode,
             };
             let shared = self.shared.clone();
             self.worker = Some(std::thread::spawn(move || capture::run(job, shared)));
             self.last_key = None;
             self.tick();
+        }
+    }
+
+    /// Name of the game the "Restart in DX11" button would act on (None = nothing to do now).
+    fn dx11_prompt(&self) -> Option<String> {
+        if self.recording() {
+            return None;
+        }
+        self.dx12_plan.as_ref().map(|p| p.name.clone())
+    }
+
+    /// Closes the game and starts it again with `-dx11` (off the UI thread: it waits for exit).
+    fn restart_dx11(&mut self) {
+        let (Some(plan), Some(t)) = (self.dx12_plan.take(), self.target.clone()) else { return };
+        self.note = format!("Restarting {} with -dx11\u{2026}", plan.name);
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let msg = match relaunch::restart(&plan, t.hwnd) {
+                Ok(()) => format!("Restarted {} with -dx11. Focus it to enable the overlay.", plan.name),
+                Err(e) => format!("Restart failed: {e}"),
+            };
+            if let Ok(mut n) = shared.note.lock() {
+                *n = Some(msg);
+            }
+        });
+    }
+
+    /// Spots Unreal games running Direct3D 12 and shows/hides the "Restart in DX11" button.
+    unsafe fn update_dx11_button(&mut self, pid: u32) {
+        unsafe {
+            if pid == 0 || self.recording() {
+                self.dx12_pid = 0;
+                if pid == 0 {
+                    self.dx12_plan = None;
+                }
+            } else if self.dx12_pid != pid || (self.dx12_plan.is_none() && self.dx12_checked.elapsed().as_secs() >= 5) {
+                // modules load shortly after launch, so a "no" is re-checked every few seconds
+                let first = self.dx12_pid != pid;
+                self.dx12_pid = pid;
+                self.dx12_checked = Instant::now();
+                self.dx12_plan = if self.hook.dx12_only(pid) { relaunch::plan(pid) } else { None };
+                if first && self.dx12_plan.is_some() {
+                    self.note = "This game renders with Direct3D 12, so the in-game overlay can't be used. \
+                                 'Restart game in DX11' relaunches it with -dx11."
+                        .into();
+                }
+            }
+            let want = self.dx12_plan.is_some() && !self.recording();
+            self.mw.set_dx11(want);
+            if want != self.dx11_wanted {
+                self.dx11_wanted = want;
+                self.dx11_hotkey = if want {
+                    // The game has focus and covers our window, so offer the restart in the
+                    // overlay with a hotkey. (If F7 is taken, the window's button still works.)
+                    RegisterHotKey(Some(self.hwnd), ID_DX11, MOD_NOREPEAT, VK_F7.0 as u32).is_ok()
+                } else {
+                    let _ = UnregisterHotKey(Some(self.hwnd), ID_DX11);
+                    false
+                };
+                self.last_key = None; // redraw the overlay with/without the hint
+            }
         }
     }
 
@@ -476,7 +561,10 @@ impl App {
             }
             // Games often grab HWND_TOPMOST themselves; keep re-asserting ours so the
             // overlay doesn't end up underneath a fullscreen-optimized game window.
-            if self.cfg.overlay && self.target.is_some() {
+            // (Throttled: tick() also runs for every recorded frame, and re-asserting z-order
+            // that often makes DWM churn over the game and slows it down.)
+            if self.cfg.overlay && self.target.is_some() && self.last_topmost.elapsed().as_millis() >= 500 {
+                self.last_topmost = Instant::now();
                 let _ = SetWindowPos(
                     self.hwnd,
                     Some(HWND_TOPMOST),
@@ -492,6 +580,7 @@ impl App {
                     self.target = Some(t);
                 }
             }
+            self.update_dx11_button(self.target.as_ref().map_or(0, |t| t.pid));
             let Some(target) = self.target.clone() else {
                 let hints = self.hints.join("  \u{00B7}  ");
                 let (rec, elapsed) = (self.recording(), self.shared.elapsed.load(Ordering::Relaxed));
@@ -537,7 +626,7 @@ impl App {
             }
             self.shared.watch_x.store((target.rect.0 + target.rect.2) / 2, Ordering::Relaxed);
             self.shared.watch_y.store((target.rect.1 + target.rect.3) / 2, Ordering::Relaxed);
-            let pulse_bucket = if rec { (time * 60.0) as i32 } else { 0 };
+            let pulse_bucket = if rec { (time * 15.0) as i32 } else { 0 };
             let key = (fps, rec, Some(target.clone()), pulse_bucket, self.cfg.overlay, elapsed);
             if self.last_key.as_ref() == Some(&key) {
                 return;
@@ -561,13 +650,20 @@ impl App {
                 self.dib = Some(make_dib(cw, ch));
             }
             let dib = self.dib.as_ref().unwrap();
+            // The overlay canvas fits four legend lines: when the DX11 offer is showing, it takes
+            // the top line and the last one (Quit) makes room for it.
+            let mut hint_lines = self.hints.clone();
+            if self.dx11_hotkey {
+                hint_lines.truncate(3);
+                hint_lines.insert(0, "F7: Restart game in DX11".to_string());
+            }
             let style = Style {
                 fps,
                 elapsed,
                 recording: rec,
                 counter_scale: cs,
                 label_scale: ls,
-                hints: &self.hints,
+                hints: &hint_lines,
                 name: &target.name,
                 time,
             };

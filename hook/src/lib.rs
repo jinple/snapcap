@@ -285,8 +285,46 @@ unsafe fn guarded(this: *mut c_void) {
         return;
     }
     IN_HOOK.set(true);
+    let t0 = unsafe { qpc() };
     let _ = std::panic::catch_unwind(|| unsafe { on_present(this) });
+    let dt = unsafe { qpc() } - t0;
     IN_HOOK.set(false);
+    // Cheap self-timing: every ~5 s write how long the hook's own work took per Present.
+    static SUM: AtomicI64 = AtomicI64::new(0);
+    static MAX: AtomicI64 = AtomicI64::new(0);
+    static N: AtomicI64 = AtomicI64::new(0);
+    static SINCE: AtomicI64 = AtomicI64::new(0);
+    SUM.fetch_add(dt, Ordering::Relaxed);
+    MAX.fetch_max(dt, Ordering::Relaxed);
+    N.fetch_add(1, Ordering::Relaxed);
+    let mut freq = QPC_FREQ.load(Ordering::Relaxed);
+    if freq == 0 {
+        let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
+        QPC_FREQ.store(freq, Ordering::Relaxed);
+    }
+    let freq = freq.max(1);
+    let since = SINCE.load(Ordering::Relaxed);
+    if since == 0 {
+        SINCE.store(t0, Ordering::Relaxed);
+    } else if (t0 - since) > freq * 5 {
+        let n = N.swap(0, Ordering::Relaxed).max(1);
+        let us = |t: i64| t as f64 * 1e6 / freq as f64;
+        let (ovl, rec, lim) = {
+            let h = header();
+            if h.is_null() { (9, 9, 0) } else { (rd!(h, enable), rd!(h, want_capture), rd!(h, fps_limit)) }
+        };
+        log(&format!(
+            "t={}s overlay={} recording={} limit={} | {:.1} presents/s, hook cost avg {:.0} us max {:.0} us",
+            GetTickCount64() / 1000 % 100000,
+            ovl,
+            rec,
+            lim,
+            n as f64 * freq as f64 / (t0 - since) as f64,
+            us(SUM.swap(0, Ordering::Relaxed)) / n as f64,
+            us(MAX.swap(0, Ordering::Relaxed)),
+        ));
+        SINCE.store(t0, Ordering::Relaxed);
+    }
 }
 
 unsafe fn header() -> *mut Header {
@@ -456,7 +494,8 @@ unsafe fn make_shared(dev: &ID3D11Device, bd: &D3D11_TEXTURE2D_DESC) -> windows:
             Format: bd.Format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            // render-target bind too: the recorder's GPU video processor wants it on its input
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32,
         };
@@ -483,6 +522,8 @@ fn rtv_format(f: DXGI_FORMAT) -> Option<(DXGI_FORMAT, bool)> {
     match f {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_TYPELESS => Some((DXGI_FORMAT_R8G8B8A8_UNORM, false)),
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_TYPELESS => Some((DXGI_FORMAT_B8G8R8A8_UNORM, false)),
+        // 10-bit SDR back buffers (Unreal Engine's default): blending our 8-bit overlay into them is fine.
+        DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS => Some((DXGI_FORMAT_R10G10B10A2_UNORM, false)),
         DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some((DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, true)),
         DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some((DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, true)),
         _ => None,
@@ -520,6 +561,16 @@ unsafe fn on_present(this: *mut c_void) {
         wr!(h, bb_w, bd.Width);
         wr!(h, bb_h, bd.Height);
         wr!(h, bb_format, bd.Format.0 as u32);
+        {
+            // one-time diagnostics: what is the game presenting?
+            static LOGGED: AtomicI64 = AtomicI64::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) == 0 {
+                log(&format!(
+                    "first present: back buffer {}x{} fmt {} (supported: {}), overlay enable={} {}x{}, want_capture={}",
+                    bd.Width, bd.Height, bd.Format.0, rtv_format(bd.Format).is_some(), rd!(h, enable), w, hh, want_cap
+                ));
+            }
+        }
         let Some((rtv_fmt, srgb)) = rtv_format(bd.Format) else { return };
 
         // keep the shared-frame resources and the draw resources under one lock
@@ -550,9 +601,13 @@ unsafe fn on_present(this: *mut c_void) {
                 }
             }
             if let Some(s) = g.shared.as_ref() {
-                if acquire(&s.mutex, 0) {
+                // Only copy when the recorder asked for a frame: this copy goes through a keyed
+                // mutex, which flushes the game's GPU pipeline, so doing it on every Present
+                // (e.g. 144/s) tanks the frame rate without loading the GPU.
+                if rd!(h, want_frame) == 1 && acquire(&s.mutex, 0) {
                     g.ctx.CopyResource(&s.tex, &bb);
                     let _ = s.mutex.ReleaseSync(0);
+                    wr!(h, want_frame, 0);
                     wr!(h, frame_seq, rd!(h, frame_seq) + 1);
                 }
             }

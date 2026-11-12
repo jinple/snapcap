@@ -23,6 +23,7 @@ const SL_COUNTER: i32 = 101;
 const SL_LABEL: i32 = 102;
 const CHK_REC: i32 = 105;
 const CHK_HOOK: i32 = 106;
+const CHK_GPU: i32 = 109;
 const SL_LIMIT: i32 = 107;
 const LBL_LIMIT: i32 = 108;
 const HK_BASE: i32 = 110; // 110..=113
@@ -69,7 +70,7 @@ pub unsafe fn open(s: &Settings) {
         });
 
         let k = GetDpiForSystem() as f32 / 96.0;
-        let (cw, ch) = ((420.0 * k) as i32, (516.0 * k) as i32);
+        let (cw, ch) = ((420.0 * k) as i32, (574.0 * k) as i32);
         let style = WS_CAPTION | WS_SYSMENU;
         let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
         let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_TOPMOST);
@@ -254,17 +255,29 @@ unsafe fn create_controls(hwnd: HWND, s: &Settings) {
         SendMessageW(hk, BM_SETCHECK, Some(WPARAM(s.hook_enabled as usize)), None);
         child(hwnd, stat, "Loads a DLL into Direct3D 11 games to draw the overlay inside them. Never used with anti-cheat. Applies the next time you play.", 0, (34, 250, 372, 34), 0, k);
 
-        child(hwnd, stat, "Keybinds  (click a box, then press the keys)", 0, (16, 294, 380, 20), 0, k);
+        let gpu = child(
+            hwnd,
+            btn,
+            "Encode recordings on the GPU (recommended)",
+            ws_tab | 3,
+            (16, 294, 390, 22),
+            CHK_GPU,
+            k,
+        );
+        SendMessageW(gpu, BM_SETCHECK, Some(WPARAM(s.gpu_encode as usize)), None);
+        child(hwnd, stat, "Far less CPU, so the game loses fewer frames. Turn off for the older CPU encoder if recordings look wrong.", 0, (34, 316, 372, 34), 0, k);
+
+        child(hwnd, stat, "Keybinds  (click a box, then press the keys)", 0, (16, 352, 380, 20), 0, k);
         for (i, name) in ACTION_NAMES.iter().enumerate() {
-            let y = 320 + 36 * i as i32;
+            let y = 378 + 36 * i as i32;
             child(hwnd, stat, name, 0, (16, y + 4, 140, 20), 0, k);
             child(hwnd, w!("msctls_hotkey32"), "", ws_tab, (160, y, 180, 26), HK_BASE + i as i32, k);
         }
         fill_keys(hwnd, &s.keys);
 
-        child(hwnd, btn, "Reset defaults", ws_tab, (16, 476, 110, 28), BTN_RESET, k);
-        child(hwnd, btn, "Save", ws_tab | 1 /*BS_DEFPUSHBUTTON*/, (236, 476, 80, 28), BTN_SAVE, k);
-        child(hwnd, btn, "Close", ws_tab, (322, 476, 80, 28), BTN_CLOSE, k);
+        child(hwnd, btn, "Reset defaults", ws_tab, (16, 534, 110, 28), BTN_RESET, k);
+        child(hwnd, btn, "Save", ws_tab | 1 /*BS_DEFPUSHBUTTON*/, (236, 534, 80, 28), BTN_SAVE, k);
+        child(hwnd, btn, "Close", ws_tab, (322, 534, 80, 28), BTN_CLOSE, k);
     }
 }
 
@@ -314,11 +327,13 @@ unsafe fn apply_visuals(hwnd: HWND) {
         set_text(hwnd, LBL_LIMIT, &limit_text(limit));
         let on = SendMessageW(get_item(hwnd, CHK_REC), BM_GETCHECK, None, None).0 == 1;
         let hook = SendMessageW(get_item(hwnd, CHK_HOOK), BM_GETCHECK, None, None).0 == 1;
+        let gpu = SendMessageW(get_item(hwnd, CHK_GPU), BM_GETCHECK, None, None).0 == 1;
         with_app(|app| {
             app.settings.counter_pct = c;
             app.settings.label_pct = l;
             app.settings.overlay_in_rec = on;
             app.settings.hook_enabled = hook;
+            app.settings.gpu_encode = gpu;
             app.settings.fps_limit = limit;
             app.apply_visuals();
         });
@@ -355,7 +370,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_COMMAND => {
                 let (id, code) = ((wp.0 & 0xFFFF) as i32, ((wp.0 >> 16) & 0xFFFF) as u32);
                 match id {
-                    CHK_REC | CHK_HOOK if code == 0 => apply_visuals(hwnd),
+                    CHK_REC | CHK_HOOK | CHK_GPU if code == 0 => apply_visuals(hwnd),
                     EDT_COUNTER | EDT_LABEL if code == 0x0300 /*EN_CHANGE*/ => {
                         let slider = if id == EDT_COUNTER { SL_COUNTER } else { SL_LABEL };
                         sync_slider_from_box(hwnd, slider, id);
@@ -374,6 +389,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         set_text(hwnd, EDT_LABEL, &d.label_pct.to_string());
                         SendMessageW(get_item(hwnd, CHK_REC), BM_SETCHECK, Some(WPARAM(d.overlay_in_rec as usize)), None);
                         SendMessageW(get_item(hwnd, CHK_HOOK), BM_SETCHECK, Some(WPARAM(d.hook_enabled as usize)), None);
+                        SendMessageW(get_item(hwnd, CHK_GPU), BM_SETCHECK, Some(WPARAM(d.gpu_encode as usize)), None);
                         SendMessageW(get_item(hwnd, SL_LIMIT), TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(d.fps_limit as isize)));
                         fill_keys(hwnd, &d.keys);
                         apply_visuals(hwnd);

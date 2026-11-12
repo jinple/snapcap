@@ -60,6 +60,9 @@ pub struct Job {
     /// Game process whose in-game hook should supply overlay-free frames (0 = use the
     /// screen duplication instead).
     pub hook_pid: u32,
+    /// Encode on the GPU (the "Encode recordings on the GPU" setting). Falls back to the CPU
+    /// path by itself if the GPU setup isn't supported.
+    pub gpu: bool,
 }
 
 use crate::hook_client::protocol::{Header, MAGIC, MAP_SIZE, frame_name, map_name};
@@ -76,6 +79,8 @@ struct HookSrc {
     fmt: DXGI_FORMAT,
     /// back buffer is R8G8B8A8; the encoder wants BGRA, so swap on the CPU
     rgba: bool,
+    /// back buffer is R10G10B10A2 (10-bit); convert to 8-bit BGRA on the CPU
+    r10: bool,
 }
 
 impl Drop for HookSrc {
@@ -104,6 +109,7 @@ unsafe fn open_hook_src(device: &ID3D11Device, pid: u32) -> std::result::Result<
             return Err("bad hook block".into());
         }
         std::ptr::write_volatile(&raw mut (*hdr).want_capture, 1);
+        std::ptr::write_volatile(&raw mut (*hdr).want_frame, 1);
         // wait for the hook to deliver its first clean frame
         let t = Instant::now();
         while std::ptr::read_volatile(&raw const (*hdr).frame_seq) == 0 {
@@ -129,11 +135,12 @@ unsafe fn open_hook_src(device: &ID3D11Device, pid: u32) -> std::result::Result<
             d.Format,
             DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_TYPELESS
         );
-        if !rgba && !bgra {
+        let r10 = matches!(d.Format, DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS);
+        if !rgba && !bgra && !r10 {
             std::ptr::write_volatile(&raw mut (*hdr).want_capture, 0);
             return Err(format!("unsupported back buffer format {}", d.Format.0));
         }
-        Ok(HookSrc { hdr, tex, mutex, w: d.Width, h: d.Height, fmt: d.Format, rgba })
+        Ok(HookSrc { hdr, tex, mutex, w: d.Width, h: d.Height, fmt: d.Format, rgba, r10 })
     }
 }
 
@@ -248,6 +255,14 @@ pub fn monitor(shared: Arc<Shared>, overlay: isize) {
             if shared.recording.load(Ordering::Relaxed) {
                 cur = None; // the recorder takes over metering
                 std::thread::sleep(Duration::from_millis(100));
+                meter = Meter::new();
+                continue;
+            }
+            // The in-game hook already reports the game's exact FPS, so don't duplicate the
+            // screen (which makes DWM copy every frame of the game) just to estimate it.
+            if shared.hook_fps10.load(Ordering::Relaxed) > 0 {
+                cur = None;
+                std::thread::sleep(Duration::from_millis(250));
                 meter = Meter::new();
                 continue;
             }
@@ -368,7 +383,7 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             &adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             None,
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -432,11 +447,10 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             MiscFlags: 0,
         };
         let mut desktop = None;
-        device.CreateTexture2D(
-            &tex_desc(mon_w, mon_h, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0), DXGI_FORMAT_B8G8R8A8_UNORM),
-            None,
-            Some(&mut desktop),
-        )?;
+        let mut desktop_desc = tex_desc(mon_w, mon_h, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0), DXGI_FORMAT_B8G8R8A8_UNORM);
+        // the GPU converter reads it (video processor inputs want render-target + shader bind flags)
+        desktop_desc.BindFlags = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        device.CreateTexture2D(&desktop_desc, None, Some(&mut desktop))?;
         let desktop = desktop.unwrap();
         // A small ring of staging textures: each frame is *read* two ticks after its copy was
         // issued, so the CPU never stalls waiting on a GPU that's busy rendering the game.
@@ -466,8 +480,46 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
         } else {
             None
         };
+        // GPU path: the video processor converts frames to NV12 on the GPU and the encoder takes
+        // the textures directly (no readback, no CPU conversion). SNAPCAP_CPU=1 forces the old
+        // CPU path; it's also the fallback if anything here isn't supported.
+        let mut gpu: Option<crate::gpuenc::GpuConv> = None;
+        if job.gpu && std::env::var_os("SNAPCAP_CPU").is_none() {
+            stage("setting up GPU conversion");
+            let src_tex = hook.as_ref().map(|s| &s.tex).unwrap_or(&desktop);
+            let src_size = hook.as_ref().map(|s| (s.w, s.h)).unwrap_or((mon_w, mon_h));
+            let step = std::cell::Cell::new("creating the video processor");
+            let attempt = (|| -> Result<crate::gpuenc::GpuConv> {
+                let mut g = crate::gpuenc::GpuConv::new(&device, job.fps, (x0, y0, w, h), src_size)?;
+                step.set("reading the source texture");
+                g.set_source(src_tex)?;
+                // a trial conversion, so an unsupported format falls back to the CPU path up front
+                step.set("trial conversion");
+                match hook.as_ref() {
+                    Some(hs) => {
+                        if !acquire_key(&hs.mutex, 200) {
+                            return Err(windows::Win32::Foundation::E_FAIL.into());
+                        }
+                        let r = g.convert();
+                        let _ = hs.mutex.ReleaseSync(0);
+                        r?;
+                    }
+                    None => {
+                        g.convert()?;
+                    }
+                }
+                Ok(g)
+            })();
+            match attempt {
+                Ok(g) => gpu = Some(g),
+                Err(e) => eprintln!("GPU conversion unavailable while {} ({e}); using the CPU path", step.get()),
+            }
+        }
+        if std::env::var_os("SNAPCAP_STATS").is_some() {
+            eprintln!("video path: {}", if gpu.is_some() { "GPU (video processor -> NV12)" } else { "CPU (readback + convert)" });
+        }
         stage("creating the MP4 encoder");
-        let (sink, stream, astream) = create_writer(job, w, h, audio.is_some())?;
+        let (sink, stream, astream) = create_writer(job, w, h, audio.is_some(), gpu.as_ref().map(|g| &g.mgr))?;
         // shared recording clock: starts only once audio + encoder are ready
         let t0 = Instant::now();
         if let Some(a) = audio.as_ref() {
@@ -490,6 +542,8 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
         let begun = Instant::now();
         let mut first_at: Option<(Instant, Duration)> = None;
         let mut meter = Meter::new();
+        let mut last_notify = Instant::now();
+        let mut burn_cache: Option<((u32, u64, u32), tiny_skia::Pixmap)> = None;
 
         while !shared.stop.load(Ordering::Relaxed) {
             waiter.until(next);
@@ -497,21 +551,69 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             late_ms += (t_wake - next).as_secs_f64() * 1e3;
             late_max = late_max.max((t_wake - next).as_secs_f64() * 1e3);
 
-            // In-game hook source: grab its latest overlay-free frame (GPU copy into staging).
+            // The burned-in overlay picture: re-render only when it changes (~15x/s) and, on the
+            // GPU path, upload it only then.
+            let burn_on = renderer.is_some() && shared.burn.load(Ordering::Relaxed);
+            let mut ovl_changed = false;
+            if let (Some(r), true) = (renderer.as_ref(), burn_on) {
+                let tt = t0.elapsed();
+                let hf = shared.hook_fps10.load(Ordering::Relaxed);
+                let fps = ((if hf > 0 { hf } else { shared.fps10.load(Ordering::Relaxed) }) + 5) / 10;
+                let style = Style {
+                    fps,
+                    elapsed: tt.as_secs(),
+                    recording: true,
+                    counter_scale: shared.counter_pct.load(Ordering::Relaxed) as f32 / 100.0,
+                    label_scale: shared.label_pct.load(Ordering::Relaxed) as f32 / 100.0,
+                    hints: &[],
+                    name: &job.name,
+                    time: tt.as_secs_f32(),
+                };
+                let key = (fps, tt.as_secs(), (tt.as_secs_f32() * 15.0) as u32);
+                if burn_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                    burn_cache = Some((key, r.render(&style, burn_scale)));
+                    ovl_changed = true;
+                }
+            }
+            if let Some(g) = gpu.as_mut() {
+                g.overlay_on = burn_on;
+                if let (true, true, Some((_, pm))) = (burn_on, ovl_changed, burn_cache.as_ref()) {
+                    let m = (18.0 * burn_scale) as i32;
+                    if let Err(e) = g.set_overlay(pm.data(), pm.width(), pm.height(), m, m) {
+                        eprintln!("overlay upload failed: {e}");
+                    }
+                }
+            }
+
+            // In-game hook source: grab its latest overlay-free frame.
             let mut issued_now = false;
+            let mut gpu_tex: Option<ID3D11Texture2D> = None;
             if let Some(hs) = hook.as_ref() {
                 if acquire_key(&hs.mutex, 100) {
-                    ctx.CopySubresourceRegion(
-                        &stagings[(issued % RING) as usize],
-                        0,
-                        0,
-                        0,
-                        0,
-                        &hs.tex,
-                        0,
-                        Some(&D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 }),
-                    );
+                    if let Some(g) = gpu.as_ref() {
+                        // convert on the GPU while we hold the game's frame
+                        match g.convert() {
+                            Ok(t) => gpu_tex = Some(t),
+                            Err(e) => {
+                                let _ = hs.mutex.ReleaseSync(0);
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        ctx.CopySubresourceRegion(
+                            &stagings[(issued % RING) as usize],
+                            0,
+                            0,
+                            0,
+                            0,
+                            &hs.tex,
+                            0,
+                            Some(&D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 }),
+                        );
+                    }
                     let _ = hs.mutex.ReleaseSync(0);
+                    // ask the hook for the next clean frame (one per recorded frame)
+                    std::ptr::write_volatile(&raw mut (*hs.hdr).want_frame, 1);
                     have_frame = true;
                     issued_now = true;
                 }
@@ -575,9 +677,20 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             }
 
             if hook.is_none() {
-                ctx.CopySubresourceRegion(&stagings[(issued % RING) as usize], 0, 0, 0, 0, &desktop, 0, Some(&src_box));
+                if let Some(g) = gpu.as_ref() {
+                    gpu_tex = Some(g.convert()?);
+                } else {
+                    ctx.CopySubresourceRegion(&stagings[(issued % RING) as usize], 0, 0, 0, 0, &desktop, 0, Some(&src_box));
+                }
             }
             let t_a = Instant::now();
+            let (sample, t_b, t_c) = if let Some(tex) = gpu_tex.take() {
+                // GPU path: the converted NV12 texture goes straight to the encoder.
+                let g = gpu.as_ref().unwrap();
+                let s = g.sample(&tex, (t_a - t0).as_nanos() as i64 / 100, sample_dur)?;
+                let t = Instant::now();
+                (s, t, t)
+            } else {
             cap_t[(issued % RING) as usize] = t_a;
             issued += 1;
             if issued < RING {
@@ -600,10 +713,19 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             buf.Lock(&mut dst, None, None)?;
             let src = mapped.pData as *const u8;
             let swap_rb = hook.as_ref().is_some_and(|s| s.rgba);
+            let ten_bit = hook.as_ref().is_some_and(|s| s.r10);
             for y in 0..h as usize {
                 let s = src.add(y * mapped.RowPitch as usize);
                 let d = dst.add(y * row);
-                if swap_rb {
+                if ten_bit {
+                    // R10G10B10A2 (r in the low bits) -> 8-bit BGRA, opaque
+                    let (s32, d32) = (s as *const u32, d as *mut u32);
+                    for x in 0..w as usize {
+                        let v = s32.add(x).read_unaligned();
+                        let (r, g, b) = ((v & 0x3FF) >> 2, ((v >> 10) & 0x3FF) >> 2, ((v >> 20) & 0x3FF) >> 2);
+                        d32.add(x).write_unaligned(0xFF00_0000 | (r << 16) | (g << 8) | b);
+                    }
+                } else if swap_rb {
                     // game back buffer is RGBA, the encoder wants BGRA
                     let (s32, d32) = (s as *const u32, d as *mut u32);
                     for x in 0..w as usize {
@@ -616,23 +738,9 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             }
             // Burn the overlay in ourselves (software). This works even in exclusive
             // fullscreen, where Windows won't composite our overlay window at all.
-            if let (Some(r), true) = (renderer.as_ref(), shared.burn.load(Ordering::Relaxed)) {
-                let tt = t0.elapsed();
-                let hf = shared.hook_fps10.load(Ordering::Relaxed);
-                let fps = ((if hf > 0 { hf } else { shared.fps10.load(Ordering::Relaxed) }) + 5) / 10;
-                let style = Style {
-                    fps,
-                    elapsed: tt.as_secs(),
-                    recording: true,
-                    counter_scale: shared.counter_pct.load(Ordering::Relaxed) as f32 / 100.0,
-                    label_scale: shared.label_pct.load(Ordering::Relaxed) as f32 / 100.0,
-                    hints: &[],
-                    name: &job.name,
-                    time: tt.as_secs_f32(),
-                };
-                let pm = r.render(&style, burn_scale);
+            if let (true, Some((_, pm))) = (burn_on, burn_cache.as_ref()) {
                 let m = (18.0 * burn_scale) as usize;
-                blend(dst, row, w as usize, h as usize, &pm, m, m);
+                blend(dst, row, w as usize, h as usize, pm, m, m);
             }
             buf.Unlock()?;
             ctx.Unmap(staging, 0);
@@ -644,6 +752,8 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             // real capture time, so video stays in sync with audio (no nominal-fps drift)
             sample.SetSampleTime((t_cap - t0).as_nanos() as i64 / 100)?;
             sample.SetSampleDuration(sample_dur)?;
+            (sample, t_b, t_c)
+            };
             stage("encoding a frame");
             sink.WriteSample(stream, &sample)?;
             if let (Some(a), Some(s)) = (audio.as_ref(), astream) {
@@ -664,7 +774,11 @@ unsafe fn record(job: &Job, shared: &Shared) -> Result<u64> {
             }
             idx += 1;
             shared.frame.store(idx, Ordering::Relaxed);
-            notify(job);
+            // Wake the UI at ~15 Hz, not once per frame: each wake re-renders the overlay.
+            if last_notify.elapsed() >= Duration::from_millis(66) {
+                last_notify = Instant::now();
+                notify(job);
+            }
 
             next += interval;
             let now = Instant::now();
@@ -762,13 +876,23 @@ unsafe fn drain_audio(sink: &IMFSinkWriter, stream: u32, a: &crate::audio::Audio
     }
 }
 
-unsafe fn create_writer(job: &Job, w: u32, h: u32, with_audio: bool) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
+unsafe fn create_writer(
+    job: &Job,
+    w: u32,
+    h: u32,
+    with_audio: bool,
+    gpu_mgr: Option<&IMFDXGIDeviceManager>,
+) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
     unsafe {
         let mut attrs = None;
-        MFCreateAttributes(&mut attrs, 2)?;
+        MFCreateAttributes(&mut attrs, 3)?;
         let attrs = attrs.unwrap();
         attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
         attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
+        if let Some(m) = gpu_mgr {
+            // lets the (hardware) encoder read our GPU textures directly
+            attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, m)?;
+        }
 
         let wide: Vec<u16> = job.path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
         let sink = MFCreateSinkWriterFromURL(PCWSTR(wide.as_ptr()), None, &attrs)?;
@@ -781,17 +905,32 @@ unsafe fn create_writer(job: &Job, w: u32, h: u32, with_audio: bool) -> Result<(
         out.SetUINT64(&MF_MT_FRAME_SIZE, pack(w, h))?;
         out.SetUINT64(&MF_MT_FRAME_RATE, pack(job.fps, 1))?;
         out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
+        if gpu_mgr.is_some() {
+            // the GPU converter produces BT.709, studio-range NV12: say so, so players decode it right
+            out.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+            out.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+            out.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+            out.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        }
         let stream = sink.AddStream(&out)?;
 
         let inp = MFCreateMediaType()?;
         inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
         inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         inp.SetUINT64(&MF_MT_FRAME_SIZE, pack(w, h))?;
         inp.SetUINT64(&MF_MT_FRAME_RATE, pack(job.fps, 1))?;
         inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
-        // positive stride == top-down, which matches what the GPU hands us
-        inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, (w * 4) as u32)?;
+        if gpu_mgr.is_some() {
+            inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+            inp.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+            inp.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+            inp.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+            inp.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        } else {
+            inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+            // positive stride == top-down, which matches what the CPU path hands us
+            inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, (w * 4) as u32)?;
+        }
         sink.SetInputMediaType(stream, &inp, None)?;
 
         let mut astream = None;

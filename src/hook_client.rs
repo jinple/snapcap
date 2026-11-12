@@ -124,6 +124,17 @@ impl HookClient {
         }
     }
 
+    /// True if `pid` passes every safety check except that it renders with Direct3D 12 only
+    /// (so a restart in Direct3D 11 would make it hookable).
+    pub unsafe fn dx12_only(&self, pid: u32) -> bool {
+        unsafe {
+            let Ok(p) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) else { return false };
+            let r = self.vet(p);
+            let _ = CloseHandle(p);
+            matches!(r, Err(e) if e.starts_with("Direct3D 12"))
+        }
+    }
+
     pub fn has(&self, pid: u32) -> bool {
         self.maps.contains_key(&pid)
     }
@@ -278,7 +289,10 @@ impl HookClient {
                     d3d11 |= name == "d3d11.dll";
                     d3d12 |= name == "d3d12.dll";
                 }
-                if d3d12 {
+                // Many D3D11 games also load d3d12.dll (e.g. Unreal with DLSS/Streamline), so only
+                // refuse when there's no d3d11.dll. A true D3D12 game that also loads d3d11.dll is
+                // harmless: the hook finds no ID3D11Device on its swap chain and does nothing.
+                if d3d12 && !d3d11 {
                     return Err("Direct3D 12 game: only Direct3D 11 is supported so far".into());
                 }
                 if !d3d11 {
